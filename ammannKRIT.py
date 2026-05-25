@@ -6,9 +6,9 @@ from pyproj import Geod
 import io
 
 # --- 1. NASTAVENÍ APLIKACE ---
-st.set_page_config(page_title="CCC Surová data & Trend", layout="wide")
-st.title("CCC Detektor: Bodová analýza a Trend pojezdů")
-st.caption("Práce s čistými surovými daty (bez mřížkování) a detekce efektivity pojezdů.")
+st.set_page_config(page_title="CCC Bodová analýza", layout="wide")
+st.title("CCC Detektor: Heatmapa a Anomálie")
+st.caption("Čistá data, inverzní detekce chyb a statistické rozložení.")
 
 # --- 2. POMOCNÉ FUNKCE ---
 @st.cache_data(show_spinner="Načítám a parsuji data...")
@@ -58,17 +58,17 @@ with st.sidebar:
         st.header("3. Očištění dat a Geometrie")
         offset_m = st.number_input("Posun anténa -> běhoun (m)", value=2.0, step=0.1)
         forward_val = st.text_input("Hodnota jízdy VPŘED", value="1")
-        min_speed_kmh = st.slider("Minimální rychlost (km/h)", 0.0, 5.0, 1.0, 0.5, help="Odstraní stání a prokluzy.")
+        min_speed_kmh = st.slider("Minimální rychlost (km/h)", 0.0, 5.0, 1.0, 0.5)
         
-        st.header("4. Vizuální nastavení")
-        colormap = st.selectbox("Paleta Heatmapy", ['Turbo', 'Viridis', 'Plasma', 'Inferno', 'Jet'], index=0)
-        point_opacity = st.slider("Průhlednost bodů", 0.1, 1.0, 0.6, 0.1, help="Nižší hodnota pomůže odhalit překrývání pojezdů.")
-        decimation = st.slider("Decimace Heatmapy", 1, 20, 2, 1)
-
-        st.header("5. Definice 'Kritických' bodů")
-        st.markdown("Zadej pásmo hodnot, které považuješ za kritické (např. nedosažení cíle nebo naopak extrémní odskoky).")
-        crit_min = st.number_input("Kritické OD (Kb):", value=1.0, step=1.0)
-        crit_max = st.number_input("Kritické DO (Kb):", value=20.0, step=1.0)
+        st.header("4. Nastavení očekávané kvality")
+        st.markdown("Definuj, jaké hodnoty $K_b$ na stavbě **očekáváš** (Tvůj cíl). Mapa zvýrazní to, co leží mimo toto pásmo.")
+        target_min = st.number_input("Očekávané minimum (Kb):", value=20.0, step=1.0)
+        target_max = st.number_input("Očekávané maximum (Kb):", value=45.0, step=1.0)
+        
+        st.header("5. Vizuální nastavení Heatmapy")
+        colormap = st.selectbox("Paleta", ['Turbo', 'Viridis', 'Plasma', 'Inferno', 'Jet'], index=0)
+        point_opacity = st.slider("Průhlednost bodů", 0.1, 1.0, 0.6, 0.1)
+        decimation = st.slider("Decimace map", 1, 20, 2, 1)
 
 # --- 4. HLAVNÍ VÝPOČETNÍ LOGIKA ---
 if uploaded_file is not None:
@@ -91,7 +91,7 @@ if uploaded_file is not None:
     else:
         geod = Geod(ellps="WGS84")
         
-        # --- VYHLAZENÍ A OFFSET ---
+        # Geometrie
         window = 5
         df['smooth_lon'] = df[col_lon].rolling(window=window, min_periods=1, center=True).mean()
         df['smooth_lat'] = df[col_lat].rolling(window=window, min_periods=1, center=True).mean()
@@ -110,141 +110,100 @@ if uploaded_file is not None:
         new_lons, new_lats, _ = geod.fwd(lons, lats, machine_heading, np.full(len(lons), offset_m))
         df['corr_lon'], df['corr_lat'] = new_lons, new_lats
         
-        # --- RYCHLOST ---
+        # Rychlost
         if col_speed == "Vypočítat z GPS (Záložní)":
             _, _, dist_step = geod.inv(df['corr_lon'].shift(), df['corr_lat'].shift(), df['corr_lon'], df['corr_lat'])
             time_step = df['parsed_time'].diff().dt.total_seconds()
             df['speed_kmh'] = (dist_step / time_step) * 3.6
             df['speed_kmh'] = df['speed_kmh'].rolling(3, min_periods=1).mean().bfill() 
         
-        # Filtrace stání
+        # Očištěná data
         df_valid = df[df['speed_kmh'] >= min_speed_kmh].copy()
         
         if not df_valid.empty:
             avg_lat = df_valid['corr_lat'].mean()
             cos_correction = 1 / np.cos(np.radians(avg_lat))
             
-            # --- DETEKCE POJEZDŮ (PRO GLOBÁLNÍ TREND) ---
-            # Pojezd definujeme jako souvislou jízdu. Změna nastane při otočení směru nebo delší pauze (např. nad 30s)
-            time_gap_cond = df_valid['parsed_time'].diff().dt.total_seconds() > 30
-            dir_cond = df_valid[col_dir] != df_valid[col_dir].shift().bfill()
-            df_valid['pass_id'] = (time_gap_cond | dir_cond).cumsum() + 1
+            tab1, tab2, tab3 = st.tabs(["1️⃣ Surová Heatmapa", "2️⃣ Mapa Anomálií (Mimo cíl)", "3️⃣ Histogram (Statistika)"])
             
-            tab1, tab2 = st.tabs(["🗺️ Mapy", "📈 Analýza 'špatného nárůstu' (Trendy)"])
+            df_plot = df_valid.iloc[::decimation]
             
             with tab1:
-                # --- MAPA 1: SUROVÁ HEATMAPA ---
                 st.subheader(f"Surová bodová Heatmapa (Paleta: {colormap})")
                 fig_raw = go.Figure()
-                
-                df_plot = df_valid.iloc[::decimation]
-                
                 fig_raw.add_trace(go.Scatter(
                     x=df_plot['corr_lon'], y=df_plot['corr_lat'], mode='markers',
-                    marker=dict(
-                        size=6, 
-                        color=df_plot[col_stiff], 
-                        colorscale=colormap, 
-                        showscale=True, 
-                        opacity=point_opacity,
-                        colorbar=dict(title="Kb [-]")
-                    ),
-                    name="Naměřená tuhost",
-                    hovertext=df_plot[col_stiff].round(1).astype(str) + ' Kb'
+                    marker=dict(size=5, color=df_plot[col_stiff], colorscale=colormap, showscale=True, opacity=point_opacity, colorbar=dict(title="Kb [-]")),
+                    name="Naměřená tuhost", hovertext=df_plot[col_stiff].round(1).astype(str) + ' Kb'
                 ))
-                
-                fig_raw.update_layout(
-                    yaxis=dict(scaleanchor="x", scaleratio=cos_correction),
-                    height=600, dragmode='pan', margin=dict(l=0, r=0, t=30, b=0)
-                )
+                fig_raw.update_layout(yaxis=dict(scaleanchor="x", scaleratio=cos_correction), height=700, dragmode='pan', margin=dict(l=0, r=0, t=30, b=0))
                 st.plotly_chart(fig_raw, use_container_width=True)
                 
-                # --- MAPA 2: KRITICKÉ BODY ---
-                st.subheader(f"Izolované Kritické body ({crit_min} až {crit_max} Kb)")
-                st.caption("Šedé pozadí ukazuje celkovou trasu pro kontext. Červeně svítí jen hodnoty ve zvoleném pásmu.")
-                fig_crit = go.Figure()
+            with tab2:
+                st.subheader(f"Anomálie: Hodnoty MIMO očekávané pásmo ({target_min} – {target_max} Kb)")
+                fig_anom = go.Figure()
                 
-                # Obarvení na šedo pro kontext
-                fig_crit.add_trace(go.Scatter(
+                # Šedý podkres (To co je v limitu = nudné, nezajímá nás)
+                fig_anom.add_trace(go.Scatter(
                     x=df_plot['corr_lon'], y=df_plot['corr_lat'], mode='markers',
-                    marker=dict(size=4, color='#E5E7EB', opacity=0.3),
-                    name="Ostatní data", hoverinfo='none'
+                    marker=dict(size=4, color='#E5E7EB', opacity=0.3), name="V cílovém pásmu", hoverinfo='none'
                 ))
                 
-                # Filtrace kritických bodů
-                df_crit = df_valid[(df_valid[col_stiff] >= crit_min) & (df_valid[col_stiff] <= crit_max)]
-                
-                if not df_crit.empty:
-                    fig_crit.add_trace(go.Scatter(
-                        x=df_crit['corr_lon'], y=df_crit['corr_lat'], mode='markers',
-                        marker=dict(
-                            size=7, 
-                            color='#EF553B', # Výrazná červená
-                            line=dict(width=1, color='black')
-                        ),
-                        name="Kritické body",
-                        hovertext="Kb: " + df_crit[col_stiff].round(1).astype(str)
+                # Podmírák (Měkké)
+                df_under = df_plot[df_plot[col_stiff] < target_min]
+                if not df_under.empty:
+                    fig_anom.add_trace(go.Scatter(
+                        x=df_under['corr_lon'], y=df_under['corr_lat'], mode='markers',
+                        marker=dict(size=6, color='red'), name=f"Nedohutněno (< {target_min})",
+                        hovertext="Měkké: " + df_under[col_stiff].round(1).astype(str) + " Kb"
                     ))
                 
-                fig_crit.update_layout(
-                    yaxis=dict(scaleanchor="x", scaleratio=cos_correction),
-                    height=600, dragmode='pan', margin=dict(l=0, r=0, t=30, b=0)
-                )
-                st.plotly_chart(fig_crit, use_container_width=True)
+                # Přehutněno / Tvrdé
+                df_over = df_plot[df_plot[col_stiff] > target_max]
+                if not df_over.empty:
+                    fig_anom.add_trace(go.Scatter(
+                        x=df_over['corr_lon'], y=df_over['corr_lat'], mode='markers',
+                        marker=dict(size=6, color='blue'), name=f"Tvrdá anomálie (> {target_max})",
+                        hovertext="Tvrdé: " + df_over[col_stiff].round(1).astype(str) + " Kb"
+                    ))
+                
+                fig_anom.update_layout(yaxis=dict(scaleanchor="x", scaleratio=cos_correction), height=700, dragmode='pan', margin=dict(l=0, r=0, t=30, b=0))
+                st.plotly_chart(fig_anom, use_container_width=True)
 
-            with tab2:
-                # --- GRAF: GLOBÁLNÍ TREND POJEZDŮ ---
-                st.subheader("Analýza efektivity hutnění (Nárůst tuhosti za celý úsek)")
-                st.markdown("""
-                Tento graf ukazuje průměrnou a mediánovou hodnotu $K_b$ pro každý souvislý pojezd válce. 
-                Sledujte **přírůstek (Deltu)**. Pokud se křivka oploští nebo začne klesat (Delta je blízko nule nebo negativní), 
-                zemina už do sebe další práci nepojme a dochází k přehutňování (tzv. odraz bubnu).
-                """)
+            with tab3:
+                st.subheader("Statistické rozložení tuhosti (Histogram)")
+                st.markdown("Ukazuje četnost všech naměřených hodnot na stavbě. Zelená oblast reprezentuje tvé cílové pásmo.")
                 
-                # Výpočet průměrů za pojezd
-                trend_df = df_valid.groupby('pass_id').agg(
-                    Průměr_Kb=(col_stiff, 'mean'),
-                    Medián_Kb=(col_stiff, 'median'),
-                    Počet_bodů=(col_stiff, 'count')
-                ).reset_index()
+                fig_hist = go.Figure()
                 
-                # Odfiltrování "mikro pojezdů" (krátké popojetí)
-                trend_df = trend_df[trend_df['Počet_bodů'] > 20].copy()
-                trend_df['Pojezd_číslo'] = range(1, len(trend_df) + 1) # Přečíslování
-                
-                # Výpočet nárůstu (Delty)
-                trend_df['Nárůst_oproti_minule'] = trend_df['Průměr_Kb'].diff().fillna(0)
-                
-                # Vykreslení
-                fig_trend = go.Figure()
-                
-                # Křivka průměru
-                fig_trend.add_trace(go.Scatter(
-                    x=trend_df['Pojezd_číslo'], y=trend_df['Průměr_Kb'],
-                    mode='lines+markers+text',
-                    text=trend_df['Průměr_Kb'].round(1),
-                    textposition="top center",
-                    marker=dict(size=12, color='#19D3F3'), line=dict(width=4),
-                    name='Průměrné Kb'
+                fig_hist.add_trace(go.Histogram(
+                    x=df_valid[col_stiff], nbinsx=50, marker_color='gray', name='Počet bodů'
                 ))
                 
-                # Sloupcový graf pro Deltu (Nárůst)
-                bar_colors = ['#00CC96' if val >= 0 else '#EF553B' for val in trend_df['Nárůst_oproti_minule']]
-                fig_trend.add_trace(go.Bar(
-                    x=trend_df['Pojezd_číslo'], y=trend_df['Nárůst_oproti_minule'],
-                    marker_color=bar_colors, opacity=0.6,
-                    name='Přírůstek Kb', yaxis='y2'
-                ))
-                
-                fig_trend.update_layout(
-                    xaxis=dict(title="Pořadí pojezdu", tickmode='linear'),
-                    yaxis=dict(title="Hodnota Kb [-]"),
-                    yaxis2=dict(title="Přírůstek (Delta)", overlaying='y', side='right', showgrid=False),
-                    height=500, hovermode="x unified", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+                # Vyznačení cílového pásma
+                fig_hist.add_vrect(
+                    x0=target_min, x1=target_max,
+                    fillcolor="green", opacity=0.2, layer="below", line_width=0,
+                    annotation_text="Cílové pásmo", annotation_position="top left"
                 )
                 
-                st.plotly_chart(fig_trend, use_container_width=True)
-                st.dataframe(trend_df.drop(columns=['pass_id']).round(2), hide_index=True)
+                fig_hist.update_layout(
+                    xaxis_title="Hodnota Kb [-]", yaxis_title="Počet naměřených bodů",
+                    height=500, bargap=0.1, hovermode="x"
+                )
+                st.plotly_chart(fig_hist, use_container_width=True)
+                
+                # Jednoduchá procentuální statistika
+                total = len(df_valid)
+                pct_under = len(df_valid[df_valid[col_stiff] < target_min]) / total * 100
+                pct_ok = len(df_valid[(df_valid[col_stiff] >= target_min) & (df_valid[col_stiff] <= target_max)]) / total * 100
+                pct_over = len(df_valid[df_valid[col_stiff] > target_max]) / total * 100
+                
+                c1, c2, c3 = st.columns(3)
+                c1.metric("🔴 Pod limitem (Nedohutněno)", f"{pct_under:.1f} %")
+                c2.metric("🟢 V cílovém pásmu (OK)", f"{pct_ok:.1f} %")
+                c3.metric("🔵 Nad limitem (Příliš tvrdé)", f"{pct_over:.1f} %")
+
         else:
             st.warning("Po odfiltrování stání a nulové rychlosti nezbyla žádná platná data.")
 else:
