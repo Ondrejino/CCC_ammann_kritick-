@@ -8,7 +8,7 @@ import io
 # --- 1. NASTAVENÍ APLIKACE ---
 st.set_page_config(page_title="CCC Bodová analýza", layout="wide")
 st.title("CCC Detektor: Heatmapa a Anomálie")
-st.caption("Čistá data, inverzní detekce chyb a statistické rozložení.")
+st.caption("Čistá data, inverzní detekce chyb a statistické rozložení (Opraveno o outliery a nulové dělení).")
 
 # --- 2. POMOCNÉ FUNKCE ---
 @st.cache_data(show_spinner="Načítám a parsuji data...")
@@ -68,7 +68,7 @@ with st.sidebar:
         st.header("5. Vizuální nastavení Heatmapy")
         colormap = st.selectbox("Paleta", ['Turbo', 'Viridis', 'Plasma', 'Inferno', 'Jet'], index=0)
         point_opacity = st.slider("Průhlednost bodů", 0.1, 1.0, 0.6, 0.1)
-        decimation = st.slider("Decimace map", 1, 20, 2, 1)
+        decimation = st.slider("Decimace map (pouze pro pozadí)", 1, 20, 2, 1)
 
 # --- 4. HLAVNÍ VÝPOČETNÍ LOGIKA ---
 if uploaded_file is not None:
@@ -110,10 +110,11 @@ if uploaded_file is not None:
         new_lons, new_lats, _ = geod.fwd(lons, lats, machine_heading, np.full(len(lons), offset_m))
         df['corr_lon'], df['corr_lat'] = new_lons, new_lats
         
-        # Rychlost
+        # OPRAVA 2: Rychlost - ošetření dělení nulou
         if col_speed == "Vypočítat z GPS (Záložní)":
             _, _, dist_step = geod.inv(df['corr_lon'].shift(), df['corr_lat'].shift(), df['corr_lon'], df['corr_lat'])
-            time_step = df['parsed_time'].diff().dt.total_seconds()
+            # Pokud je časový krok 0, nahradíme ho 0.001s, aby nedošlo k dělení nulou a generování 'inf'
+            time_step = df['parsed_time'].diff().dt.total_seconds().replace(0, 0.001)
             df['speed_kmh'] = (dist_step / time_step) * 3.6
             df['speed_kmh'] = df['speed_kmh'].rolling(3, min_periods=1).mean().bfill() 
         
@@ -126,15 +127,16 @@ if uploaded_file is not None:
             
             tab1, tab2, tab3 = st.tabs(["1️⃣ Surová Heatmapa", "2️⃣ Mapa Anomálií (Mimo cíl)", "3️⃣ Histogram (Statistika)"])
             
-            df_plot = df_valid.iloc[::decimation]
+            # Decimace POUZE pro pozadí
+            df_plot_background = df_valid.iloc[::decimation]
             
             with tab1:
                 st.subheader(f"Surová bodová Heatmapa (Paleta: {colormap})")
                 fig_raw = go.Figure()
                 fig_raw.add_trace(go.Scatter(
-                    x=df_plot['corr_lon'], y=df_plot['corr_lat'], mode='markers',
-                    marker=dict(size=5, color=df_plot[col_stiff], colorscale=colormap, showscale=True, opacity=point_opacity, colorbar=dict(title="Kb [-]")),
-                    name="Naměřená tuhost", hovertext=df_plot[col_stiff].round(1).astype(str) + ' Kb'
+                    x=df_plot_background['corr_lon'], y=df_plot_background['corr_lat'], mode='markers',
+                    marker=dict(size=5, color=df_plot_background[col_stiff], colorscale=colormap, showscale=True, opacity=point_opacity, colorbar=dict(title="Kb [-]")),
+                    name="Naměřená tuhost", hovertext=df_plot_background[col_stiff].round(1).astype(str) + ' Kb'
                 ))
                 fig_raw.update_layout(yaxis=dict(scaleanchor="x", scaleratio=cos_correction), height=700, dragmode='pan', margin=dict(l=0, r=0, t=30, b=0))
                 st.plotly_chart(fig_raw, use_container_width=True)
@@ -143,14 +145,15 @@ if uploaded_file is not None:
                 st.subheader(f"Anomálie: Hodnoty MIMO očekávané pásmo ({target_min} – {target_max} Kb)")
                 fig_anom = go.Figure()
                 
-                # Šedý podkres (To co je v limitu = nudné, nezajímá nás)
+                # Šedý podkres (To co je v limitu = nudné, nezajímá nás). Zde decimace nevadí.
+                df_ok_bg = df_plot_background[(df_plot_background[col_stiff] >= target_min) & (df_plot_background[col_stiff] <= target_max)]
                 fig_anom.add_trace(go.Scatter(
-                    x=df_plot['corr_lon'], y=df_plot['corr_lat'], mode='markers',
-                    marker=dict(size=4, color='#E5E7EB', opacity=0.3), name="V cílovém pásmu", hoverinfo='none'
+                    x=df_ok_bg['corr_lon'], y=df_ok_bg['corr_lat'], mode='markers',
+                    marker=dict(size=4, color='#E5E7EB', opacity=0.3), name="V cílovém pásmu (Pozadí)", hoverinfo='none'
                 ))
                 
-                # Podmírák (Měkké)
-                df_under = df_plot[df_plot[col_stiff] < target_min]
+                # OPRAVA 1: Podmírák a Tvrdé anomálie se VŽDY tahají z plného datasetu (df_valid), žádná decimace!
+                df_under = df_valid[df_valid[col_stiff] < target_min]
                 if not df_under.empty:
                     fig_anom.add_trace(go.Scatter(
                         x=df_under['corr_lon'], y=df_under['corr_lat'], mode='markers',
@@ -158,8 +161,7 @@ if uploaded_file is not None:
                         hovertext="Měkké: " + df_under[col_stiff].round(1).astype(str) + " Kb"
                     ))
                 
-                # Přehutněno / Tvrdé
-                df_over = df_plot[df_plot[col_stiff] > target_max]
+                df_over = df_valid[df_valid[col_stiff] > target_max]
                 if not df_over.empty:
                     fig_anom.add_trace(go.Scatter(
                         x=df_over['corr_lon'], y=df_over['corr_lat'], mode='markers',
@@ -187,17 +189,22 @@ if uploaded_file is not None:
                     annotation_text="Cílové pásmo", annotation_position="top left"
                 )
                 
+                # OPRAVA 3: Ořez extrémních outlierů (Osa X končí na 99. percentilu + malá rezerva)
+                max_val_99 = df_valid[col_stiff].quantile(0.99)
+                safe_max = max(target_max * 1.2, max_val_99) # Zajišťuje, že minimálně cílové pásmo je vždy bezpečně vidět
+                
                 fig_hist.update_layout(
                     xaxis_title="Hodnota Kb [-]", yaxis_title="Počet naměřených bodů",
+                    xaxis=dict(range=[0, safe_max]), # Ochrana proti roztáhnutí kvůli chybě senzoru
                     height=500, bargap=0.1, hovermode="x"
                 )
                 st.plotly_chart(fig_hist, use_container_width=True)
                 
-                # Jednoduchá procentuální statistika
+                # Jednoduchá procentuální statistika (Z nezdecimovaných dat)
                 total = len(df_valid)
-                pct_under = len(df_valid[df_valid[col_stiff] < target_min]) / total * 100
+                pct_under = len(df_under) / total * 100
                 pct_ok = len(df_valid[(df_valid[col_stiff] >= target_min) & (df_valid[col_stiff] <= target_max)]) / total * 100
-                pct_over = len(df_valid[df_valid[col_stiff] > target_max]) / total * 100
+                pct_over = len(df_over) / total * 100
                 
                 c1, c2, c3 = st.columns(3)
                 c1.metric("🔴 Pod limitem (Nedohutněno)", f"{pct_under:.1f} %")
