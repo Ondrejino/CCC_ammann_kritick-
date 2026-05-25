@@ -6,11 +6,11 @@ from pyproj import Geod
 import io
 
 # --- 1. NASTAVENÍ APLIKACE ---
-st.set_page_config(page_title="CCC Detektor anomálií", layout="wide")
-st.title("CCC Detektor: Vyhledávání kritických oblastí")
-st.caption("Automatická detekce 'měkkých míst' s odfiltrováním okrajových podmínek jízdy.")
+st.set_page_config(page_title="CCC Plošná analýza", layout="wide")
+st.title("CCC Detektor: Historie a rozrušení vrstvy")
+st.caption("Chytrá mřížková analýza detekující finální stav i propady tuhosti během hutnění.")
 
-# --- 2. POMOCNÉ FUNKCE (Zůstávají stejné) ---
+# --- 2. POMOCNÉ FUNKCE ---
 @st.cache_data(show_spinner="Načítám a parsuji data...")
 def nacti_surova_data(file_bytes):
     sample_text = file_bytes[:10000].decode("utf-8", errors="ignore")
@@ -28,10 +28,11 @@ def nacti_surova_data(file_bytes):
     df.columns = df.columns.str.strip().str.replace('"', '').str.replace("'", "")
     return df
 
-def najdi_vychozi_sloupec(columns, klicove_slovo):
+def najdi_vychozi_sloupec(columns, klicova_slova):
     for col in columns:
-        if klicove_slovo in col.lower():
-            return col
+        for slovo in klicova_slova:
+            if slovo in col.lower():
+                return col
     return columns[0] if len(columns) > 0 else None
 
 # --- 3. BOČNÍ PANEL ---
@@ -43,38 +44,48 @@ with st.sidebar:
         df_raw = nacti_surova_data(uploaded_file.getvalue())
         
         st.header("2. Ověření sloupců")
-        col_time = st.selectbox("Sloupec s ČASEM", df_raw.columns, index=df_raw.columns.get_loc(najdi_vychozi_sloupec(df_raw.columns, 'time')))
-        col_lat = st.selectbox("Sloupec LATITUDE", df_raw.columns, index=df_raw.columns.get_loc(najdi_vychozi_sloupec(df_raw.columns, 'latitude')))
-        col_lon = st.selectbox("Sloupec LONGITUDE", df_raw.columns, index=df_raw.columns.get_loc(najdi_vychozi_sloupec(df_raw.columns, 'longitude')))
-        col_stiff = st.selectbox("Sloupec TUHOSTI (Kb)", df_raw.columns, index=df_raw.columns.get_loc(najdi_vychozi_sloupec(df_raw.columns, 'stiff')))
-        col_dir = st.selectbox("Sloupec SMĚRU", df_raw.columns, index=df_raw.columns.get_loc(najdi_vychozi_sloupec(df_raw.columns, 'direction')))
+        col_time = st.selectbox("Sloupec s ČASEM", df_raw.columns, index=df_raw.columns.get_loc(najdi_vychozi_sloupec(df_raw.columns, ['time'])))
+        col_lat = st.selectbox("Sloupec LATITUDE", df_raw.columns, index=df_raw.columns.get_loc(najdi_vychozi_sloupec(df_raw.columns, ['latitude'])))
+        col_lon = st.selectbox("Sloupec LONGITUDE", df_raw.columns, index=df_raw.columns.get_loc(najdi_vychozi_sloupec(df_raw.columns, ['longitude'])))
+        col_stiff = st.selectbox("Sloupec TUHOSTI (Kb)", df_raw.columns, index=df_raw.columns.get_loc(najdi_vychozi_sloupec(df_raw.columns, ['stiff', 'kb'])))
+        col_dir = st.selectbox("Sloupec SMĚRU", df_raw.columns, index=df_raw.columns.get_loc(najdi_vychozi_sloupec(df_raw.columns, ['direction', 'dir'])))
+        
+        speed_options = ["Vypočítat z GPS (Záložní)"] + list(df_raw.columns)
+        speed_guess = najdi_vychozi_sloupec(df_raw.columns, ['speed', 'rychlost'])
+        default_speed_idx = speed_options.index(speed_guess) if speed_guess else 0
+        col_speed = st.selectbox("Sloupec s RYCHLOSTÍ", speed_options, index=default_speed_idx)
         
         st.header("3. Očištění dat (Filtry)")
         offset_m = st.number_input("Posun anténa -> běhoun (m)", value=2.0, step=0.1)
         forward_val = st.text_input("Hodnota jízdy VPŘED", value="1")
+        min_speed_kmh = st.slider("Minimální rychlost (km/h)", 0.0, 5.0, 1.0, 0.5)
         
-        st.markdown("**Filtrace rychlosti (odstranění stání a otáčení):**")
-        min_speed_kmh = st.slider("Minimální rychlost (km/h)", 0.0, 5.0, 1.0, 0.5, help="Body s nižší rychlostí budou ignorovány.")
+        st.header("4. Analýza chování (Kritéria)")
+        lim_critical = st.number_input("Kritická hodnota FINÁLNÍ (Méně než:)", value=15.0, step=1.0)
+        # NOVÝ SLIDER PRO DETEKCI DEKOMPAKCE
+        max_drop = st.slider("Tolerovaný propad tuhosti (Kb)", 1.0, 20.0, 8.0, 1.0, help="Pokud tuhost mezi pojezdy spadne o více než tuto hodnotu, místo bude oranžové.")
         
-        st.header("4. Nastavení kritických zón")
-        st.markdown("Definujte hranice pro klasifikaci tuhosti Kb:")
-        lim_critical = st.number_input("Kritická hodnota (Méně než:)", value=15.0, step=1.0)
-        lim_warning = st.number_input("Varovná hodnota (Méně než:)", value=25.0, step=1.0)
+        st.header("5. Nastavení Mřížky")
+        grid_size_m = st.slider("Velikost buňky sítě (m)", 0.5, 5.0, 2.0, 0.5)
+        pixel_size = st.slider("Vizuální velikost čtverců", 5, 30, 15)
         
-        st.header("5. Zobrazení na mapě")
-        show_critical = st.checkbox("🔴 Zobrazit Kritická místa", value=True)
-        show_warning = st.checkbox("🟠 Zobrazit Varovná místa", value=True)
-        show_good = st.checkbox("🟢 Zobrazit Vyhovující (pouze pro kontext)", value=False)
-        decimation = st.slider("Decimace mapy (pro rychlost)", 1, 50, 5, 1)
+        show_red = st.checkbox("🔴 Nevyhovující finální stav", value=True)
+        show_orange = st.checkbox("🟠 Problém v průběhu (Rozrušení)", value=True)
+        show_green = st.checkbox("🟢 Bezproblémové hutnění", value=True)
 
 # --- 4. HLAVNÍ VÝPOČETNÍ LOGIKA ---
 if uploaded_file is not None:
     df = df_raw.copy()
     
-    # Převody datových typů
     for col in [col_lat, col_lon, col_stiff]:
         df[col] = pd.to_numeric(df[col].astype(str).str.replace(',', '.'), errors='coerce')
     df['parsed_time'] = pd.to_datetime(df[col_time].astype(str).str.split(' GMT').str[0], errors='coerce')
+    
+    if col_speed != "Vypočítat z GPS (Záložní)":
+        df['speed_kmh'] = pd.to_numeric(df[col_speed].astype(str).str.replace(',', '.'), errors='coerce')
+    else:
+        df['speed_kmh'] = 0.0
+
     df = df.dropna(subset=[col_lat, col_lon, col_stiff, 'parsed_time']).sort_values('parsed_time').reset_index(drop=True)
     
     if len(df) < 5:
@@ -82,7 +93,6 @@ if uploaded_file is not None:
     else:
         geod = Geod(ellps="WGS84")
         
-        # --- KOREKCE GPS A VÝPOČET AZIMUTU ---
         window = 5
         df['smooth_lon'] = df[col_lon].rolling(window=window, min_periods=1, center=True).mean()
         df['smooth_lat'] = df[col_lat].rolling(window=window, min_periods=1, center=True).mean()
@@ -92,7 +102,7 @@ if uploaded_file is not None:
         
         step = 3
         fwd_az = np.zeros(len(df))
-        az, _, dists = geod.inv(lons_s[:-step], lats_s[:-step], lons_s[step:], lats_s[step:])
+        az, _, _ = geod.inv(lons_s[:-step], lats_s[:-step], lons_s[step:], lats_s[step:])
         fwd_az[:-step] = az
         fwd_az[-step:] = az[-1] if len(az) > 0 else 0
         
@@ -101,83 +111,87 @@ if uploaded_file is not None:
         new_lons, new_lats, _ = geod.fwd(lons, lats, machine_heading, np.full(len(lons), offset_m))
         df['corr_lon'], df['corr_lat'] = new_lons, new_lats
         
-        # --- VÝPOČET RYCHLOSTI PRO FILTRACI OKRAJŮ ---
-        # Spočítáme vzdálenost mezi sousedními body
-        _, _, dist_step = geod.inv(df['corr_lon'].shift(), df['corr_lat'].shift(), df['corr_lon'], df['corr_lat'])
-        time_step = df['parsed_time'].diff().dt.total_seconds()
+        if col_speed == "Vypočítat z GPS (Záložní)":
+            _, _, dist_step = geod.inv(df['corr_lon'].shift(), df['corr_lat'].shift(), df['corr_lon'], df['corr_lat'])
+            time_step = df['parsed_time'].diff().dt.total_seconds()
+            df['speed_kmh'] = (dist_step / time_step) * 3.6
+            df['speed_kmh'] = df['speed_kmh'].rolling(3, min_periods=1).mean().bfill() 
         
-        # Rychlost v m/s převedená na km/h
-        df['speed_kmh'] = (dist_step / time_step) * 3.6
-        # Vyhlazení rychlosti, aby nevyhazovala náhodné výkyvy
-        df['speed_kmh'] = df['speed_kmh'].rolling(3, min_periods=1).mean().bfill() 
-        
-        # --- APLIKACE FILTRŮ ---
-        # Zahození dat, kde stroj stál nebo jel moc pomalu (otáčení atd.)
         df_valid = df[df['speed_kmh'] >= min_speed_kmh].copy()
         
-        # Klasifikace tuhosti do kategorií
-        conditions = [
-            (df_valid[col_stiff] < lim_critical),
-            (df_valid[col_stiff] >= lim_critical) & (df_valid[col_stiff] < lim_warning),
-            (df_valid[col_stiff] >= lim_warning)
-        ]
-        choices = ['Kritické', 'Varovné', 'Vyhovující']
-        df_valid['Kategorie'] = np.select(conditions, choices, default='Neznámé')
-        
-        # Vizuální korekce mapy
-        avg_lat = df_valid['corr_lat'].mean()
-        cos_correction = 1 / np.cos(np.radians(avg_lat))
-        
-        # --- VYKRESLENÍ MAPY ---
-        st.subheader("Mapa kritických anomálií")
-        fig = go.Figure()
-        
-        # 1. Podkres celkové trasy (Očištěná od stání, zdecimovaná)
-        df_bg = df_valid.iloc[::decimation]
-        fig.add_trace(go.Scatter(
-            x=df_bg['corr_lon'], y=df_bg['corr_lat'], mode='markers',
-            marker=dict(size=3, color='#E5E7EB', opacity=0.5), name='Celková ujetá trasa', hoverinfo='none'
-        ))
-        
-        # 2. Vykreslení kategorií na základě zaškrtávátek
-        colors = {'Kritické': 'red', 'Varovné': 'orange', 'Vyhovující': 'green'}
-        
-        for cat, color in colors.items():
-            # Zda má být tato kategorie zobrazena
-            if (cat == 'Kritické' and not show_critical) or \
-               (cat == 'Varovné' and not show_warning) or \
-               (cat == 'Vyhovující' and not show_good):
-                continue
+        if not df_valid.empty:
+            avg_lat = df_valid['corr_lat'].mean()
+            lat_step = grid_size_m / 111320
+            lon_step = grid_size_m / (111320 * np.cos(np.radians(avg_lat)))
+            
+            df_valid['lat_bin'] = (df_valid['corr_lat'] // lat_step) * lat_step + (lat_step / 2)
+            df_valid['lon_bin'] = (df_valid['corr_lon'] // lon_step) * lon_step + (lon_step / 2)
+            
+            # --- ZDE JE TA CHYTRÁ MAGIE HISTORIE BUŇKY ---
+            # 1. Seřadíme absolutně vše podle času
+            df_valid = df_valid.sort_values(by=['lat_bin', 'lon_bin', 'parsed_time'])
+            
+            # 2. Spočítáme rozdíl Kb oproti předchozímu záznamu ve STEJNÉM čtverci
+            df_valid['Kb_diff'] = df_valid.groupby(['lat_bin', 'lon_bin'])[col_stiff].diff()
+            
+            # 3. Agregujeme historii pro každý čtverec
+            df_grid = df_valid.groupby(['lat_bin', 'lon_bin']).agg(
+                Final_Kb=(col_stiff, 'last'), # Poslední naměřená hodnota
+                Max_Propad=(col_stiff, lambda x: x.diff().min() if len(x)>1 else 0), # Největší pokles
+                Pocet_Bodu=(col_stiff, 'count')
+            ).reset_index()
+            
+            # 4. Klasifikace (Prioritu má červená - finální průser)
+            conditions = [
+                (df_grid['Final_Kb'] < lim_critical), 
+                (df_grid['Max_Propad'] <= -max_drop) & (df_grid['Final_Kb'] >= lim_critical),
+                (df_grid['Final_Kb'] >= lim_critical)
+            ]
+            choices = ['Nezhutněno (Finální stav)', 'Rozrušení (Propad v průběhu)', 'Stabilní / OK']
+            df_grid['Kategorie'] = np.select(conditions, choices, default='Neznámé')
+            
+            cos_correction = 1 / np.cos(np.radians(avg_lat))
+            
+            # --- VYKRESLENÍ MAPY ---
+            st.subheader(f"Analýza historie zhutňování ({grid_size_m}x{grid_size_m} m)")
+            fig = go.Figure()
+            
+            colors = {'Nezhutněno (Finální stav)': '#EF553B', 'Rozrušení (Propad v průběhu)': '#FFA15A', 'Stabilní / OK': '#00CC96'}
+            
+            for cat, color in colors.items():
+                if (cat == 'Nezhutněno (Finální stav)' and not show_red) or \
+                   (cat == 'Rozrušení (Propad v průběhu)' and not show_orange) or \
+                   (cat == 'Stabilní / OK' and not show_green):
+                    continue
+                    
+                df_cat = df_grid[df_grid['Kategorie'] == cat]
                 
-            df_cat = df_valid[df_valid['Kategorie'] == cat]
-            # Pro kritická místa chceme vidět vše, nebudeme tolik decimovat
-            if not df_cat.empty:
-                step_cat = 1 if cat == 'Kritické' else (2 if cat == 'Varovné' else decimation)
-                df_plot = df_cat.iloc[::step_cat]
-                
-                fig.add_trace(go.Scatter(
-                    x=df_plot['corr_lon'], y=df_plot['corr_lat'], mode='markers',
-                    marker=dict(size=6, color=color, line=dict(width=1, color='dark'+color)),
-                    name=f'{cat} (Kb < {lim_critical if cat == "Kritické" else lim_warning})',
-                    hovertext=df_plot[col_stiff].round(1).astype(str) + ' Kb (' + df_plot['speed_kmh'].round(1).astype(str) + ' km/h)'
-                ))
+                if not df_cat.empty:
+                    # Různé texty do hoveru podle toho, co je za problém
+                    if cat == 'Rozrušení (Propad v průběhu)':
+                        hover_text = "Finální Kb: " + df_cat['Final_Kb'].round(1).astype(str) + "<br>⚠️ Max propad v historii: " + df_cat['Max_Propad'].round(1).astype(str) + " Kb"
+                    else:
+                        hover_text = "Finální Kb: " + df_cat['Final_Kb'].round(1).astype(str) + "<br>Běžných bodů: " + df_cat['Pocet_Bodu'].astype(str)
 
-        fig.update_layout(
-            yaxis=dict(scaleanchor="x", scaleratio=cos_correction),
-            height=800, dragmode='pan',
-            legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01, bgcolor="rgba(255, 255, 255, 0.8)")
-        )
-        st.plotly_chart(fig, use_container_width=True)
-        
-        # --- STATISTIKA ---
-        st.subheader("Statistika po filtraci")
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Celkem analyzováno bodů", len(df_valid))
-        col2.metric("Kritických bodů", len(df_valid[df_valid['Kategorie'] == 'Kritické']))
-        col3.metric("Odfiltrováno okrajů (stání)", len(df) - len(df_valid))
-        
-        # Export dat
-        csv_export = df_valid[df_valid['Kategorie'].isin(['Kritické', 'Varovné'])].to_csv(index=False, sep=';', decimal=',').encode('utf-8-sig')
-        st.download_button("📥 Stáhnout pouze chybová místa do CSV", csv_export, "Anomalie.csv", "text/csv")
+                    fig.add_trace(go.Scatter(
+                        x=df_cat['lon_bin'], y=df_cat['lat_bin'], mode='markers',
+                        marker=dict(symbol='square', size=pixel_size, color=color, opacity=0.8),
+                        name=f'{cat}', hovertext=hover_text
+                    ))
+
+            fig.update_layout(
+                yaxis=dict(scaleanchor="x", scaleratio=cos_correction),
+                height=800, dragmode='pan', legend=dict(title="Analýza buněk:")
+            )
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # --- STATISTIKA ---
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Finálně nezhutněno", len(df_grid[df_grid['Kategorie'] == 'Nezhutněno (Finální stav)']))
+            col2.metric("Podezřelé (Propady)", len(df_grid[df_grid['Kategorie'] == 'Rozrušení (Propad v průběhu)']))
+            col3.metric("Dobře hutněno", len(df_grid[df_grid['Kategorie'] == 'Stabilní / OK']))
+            
+        else:
+            st.warning("Po odfiltrování nezbyla žádná data.")
 else:
-    st.info("👋 Nahrajte CSV z válce. Skript automaticky odfiltruje stání stroje a najde měkká místa.")
+    st.info("👋 Nahrajte CSV. Skript zanalyzuje historii zhutňování každé části pláně.")
