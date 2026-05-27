@@ -37,7 +37,7 @@ def najdi_vychozi_sloupec(columns, klicova_slova):
 
 # --- NOVÉ: CACHOVANÉ GEOPROSTOROVÉ ZPRACOVÁNÍ ---
 @st.cache_data(show_spinner="Zpracovávám geodata, azimuty a pojezdy (počítá se jen jednou)...")
-def zpracuj_geodata(df_raw, col_lat, col_lon, col_stiff, col_vib, col_time, col_speed, col_dir, offset_m, min_speed_kmh):
+def zpracuj_geodata(df_raw, col_lat, col_lon, col_stiff, col_vib, col_time, col_speed, col_dir, offset_m, offset_transverse_m, min_speed_kmh):
     df = df_raw.copy()
     
     # Převody
@@ -73,8 +73,17 @@ def zpracuj_geodata(df_raw, col_lat, col_lon, col_stiff, col_vib, col_time, col_
     
     is_forward = (df[col_dir].astype(str) == "1").values
     machine_heading = np.where(is_forward, fwd_az, (fwd_az + 180) % 360)
-    new_lons, new_lats, _ = geod.fwd(df[col_lon].values, df[col_lat].values, machine_heading, np.full(len(df), offset_m))
+    
+    # --- MATEMATIKA L-tvaru (Korekce Anténa -> Běhoun) ---
+    # Krok 1: Podélný posun (vpřed/vzad)
+    temp_lons, temp_lats, _ = geod.fwd(df[col_lon].values, df[col_lat].values, machine_heading, np.full(len(df), offset_m))
+    
+    # Krok 2: Příčný posun (kolmo na směr jízdy). +90 stupňů = doprava
+    transverse_heading = (machine_heading + 90) % 360
+    new_lons, new_lats, _ = geod.fwd(temp_lons, temp_lats, transverse_heading, np.full(len(df), offset_transverse_m))
+    
     df['corr_lon'], df['corr_lat'] = new_lons, new_lats
+    # ----------------------------------------------------
     
     # Rychlost (Záložní)
     if col_speed == "Vypočítat z GPS (Záložní)":
@@ -116,8 +125,9 @@ with st.sidebar:
         speed_guess = najdi_vychozi_sloupec(df_raw.columns, ['speed', 'rychlost'])
         col_speed = st.selectbox("Sloupec RYCHLOSTI", speed_options, index=speed_options.index(speed_guess) if speed_guess else 0)
         
-        st.header("3. Parametry analýzy")
-        offset_m = st.number_input("Posun anténa -> běhoun (m)", value=2.0, step=0.1)
+        st.header("3. Parametry stroje")
+        offset_m = st.number_input("Podélný posun anténa -> běhoun (m)", value=2.0, step=0.1)
+        offset_transverse_m = st.number_input("Příčný posun anténa -> běhoun (m) [kladné = vpravo, záporné = vlevo]", value=0.20, step=0.05)
         min_speed_kmh = st.slider("Minimální rychlost (km/h)", 0.0, 5.0, 1.0, 0.5)
         
         st.header("4. Nastavení Limitů a Mřížky")
@@ -131,28 +141,24 @@ with st.sidebar:
 # --- 4. HLAVNÍ VÝPOČETNÍ LOGIKA ---
 if uploaded_file is not None:
     
-    # ⚡ Využití cachované funkce pro masivní zrychlení
-    df_valid = zpracuj_geodata(df_raw, col_lat, col_lon, col_stiff, col_vib, col_time, col_speed, col_dir, offset_m, min_speed_kmh)
+    # ⚡ Využití cachované funkce pro masivní zrychlení (nyní včetně příčného posunu)
+    df_valid = zpracuj_geodata(df_raw, col_lat, col_lon, col_stiff, col_vib, col_time, col_speed, col_dir, offset_m, offset_transverse_m, min_speed_kmh)
     
     if not df_valid.empty:
         max_pass = int(df_valid['pass_id'].max())
         avg_lat = df_valid['corr_lat'].mean()
         cos_correction = 1 / np.cos(np.radians(avg_lat))
 
-        # --- GLOBÁLNÍ STROJ ČASU ---
         st.markdown("### ⏱️ Stroj času: Přehrávač hutnění")
         selected_pass = st.slider("Zobrazit stav pojezdu (Vrstvy) do čísla:", min_value=1, max_value=max_pass, value=max_pass)
         
-        # Filtrování už zpracovaných dat bleskovou rychlostí
         df_current = df_valid[df_valid['pass_id'] <= selected_pass].copy()
         
-        # Mřížkování
         lat_step = grid_size_m / 111320
         lon_step = grid_size_m / (111320 * np.cos(np.radians(avg_lat)))
         df_current['lat_bin'] = (df_current['corr_lat'] // lat_step) * lat_step + (lat_step / 2)
         df_current['lon_bin'] = (df_current['corr_lon'] // lon_step) * lon_step + (lon_step / 2)
         
-        # Filtry vibrací
         df_vib = df_current[df_current['is_vibrating'] == True].copy()
         
         df_current_sorted = df_current.sort_values('parsed_time')
@@ -162,7 +168,6 @@ if uploaded_file is not None:
         ).reset_index()
         df_ironing['Is_Ironed'] = ~df_ironing['Last_Is_Vibrating']
 
-        # ZÁLOŽKY
         tab1, tab2, tab3, tab4, tab5 = st.tabs([
             "🕹️ 1. Simulace (Vibrace)", 
             "🏁 2. Finální Kb", 
@@ -173,7 +178,7 @@ if uploaded_file is not None:
         
         with tab1:
             st.subheader(f"Vývoj tuhosti (Pojezd 1 až {selected_pass}) - Vibrační běhy")
-            st.caption("Čistá data reprezentující aktuální stav podkladu (vyčištěno od statických pojezdů).")
+            st.caption("Čistá data reprezentující aktuální stav podkladu. Body jsou již prostorově korigovány o podélný i příčný offset.")
             fig_raw = go.Figure()
             fig_raw.add_trace(go.Scatter(
                 x=df_vib['corr_lon'], y=df_vib['corr_lat'], mode='markers',
@@ -185,8 +190,6 @@ if uploaded_file is not None:
 
         with tab2:
             st.subheader(f"Mapa finální kvality (Poslední platné Kb)")
-            st.caption(f"Zobrazuje poslední VIBRAČNÍ hodnotu tuhosti (Kb) v každé buňce ({grid_size_m}x{grid_size_m}m). Ignoruje žehlení.")
-            
             df_vib_sorted = df_vib.sort_values('parsed_time')
             df_final = df_vib_sorted.groupby(['lat_bin', 'lon_bin']).agg(
                 Last_Kb=(col_stiff, 'last'),
@@ -208,7 +211,6 @@ if uploaded_file is not None:
 
         with tab3:
             st.subheader(f"Mapa Anomálií (Po pojezdu {selected_pass})")
-            st.caption(f"Kontrola limitů. Očekávaný cíl: {target_min} až {target_max} Kb. Pouze z vibračních dat.")
             fig_anom = go.Figure()
             
             df_ok_bg = df_vib[(df_vib[col_stiff] >= target_min) & (df_vib[col_stiff] <= target_max)]
@@ -261,8 +263,6 @@ if uploaded_file is not None:
 
         with tab5:
             st.subheader(f"Uzavření vrstvy proti vodě (Přežehlení)")
-            st.caption(f"Mapa zjišťuje, zda byl v buňce mřížky úplně poslední pojezd proveden staticky (bez vibrací), čímž došlo k finálnímu uhlazení a uzavření pórů.")
-            
             fig_iron = go.Figure()
             
             colors_iron = np.where(df_ironing['Is_Ironed'], '#22c55e', '#ef4444')
