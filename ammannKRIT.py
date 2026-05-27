@@ -61,7 +61,7 @@ with st.sidebar:
         st.header("4. Nastavení Limitů a Mřížky")
         target_min = st.number_input("Cílové minimum (Kb):", value=20.0, step=1.0)
         target_max = st.number_input("Cílové maximum (Kb):", value=45.0, step=1.0)
-        grid_size_m = st.slider("Velikost mřížky pro Diferenční mapu (m)", 0.5, 3.0, 1.0, 0.5)
+        grid_size_m = st.slider("Velikost mřížky pro Finální mapu (m)", 0.5, 3.0, 1.0, 0.5)
         
         st.header("5. Vizuál")
         colormap = st.selectbox("Paleta Heatmapy", ['Turbo', 'Viridis', 'Plasma', 'Inferno', 'Jet'], index=0)
@@ -131,7 +131,7 @@ if uploaded_file is not None:
             # ZÁLOŽKY
             tab1, tab2, tab3, tab4 = st.tabs([
                 "🕹️ 1. Simulace (Surová Heatmapa)", 
-                "🗺️ 2. Diferenční mapa (Δ Kb)", 
+                "🏁 2. Finální mapa (Poslední Kb)", 
                 "🔴 3. Mapa Anomálií", 
                 "📊 4. Histogram"
             ])
@@ -149,43 +149,36 @@ if uploaded_file is not None:
                 st.plotly_chart(fig_raw, use_container_width=True)
 
             with tab2:
-                st.subheader(f"Diferenční mapa: Čistý přírůstek tuhosti (Δ Kb)")
-                st.caption(f"Ukazuje, co s pláním reálně udělaly pojezdy. Zelená = roste, Červená = materiál se rozvolňuje (dekompakce). Mřížka: {grid_size_m}x{grid_size_m}m.")
+                st.subheader(f"Mapa finální kvality (Poslední zaznamenané Kb)")
+                st.caption(f"Zobrazuje poslední hodnotu tuhosti (Kb) zaznamenanou v každé buňce mřížky ({grid_size_m}x{grid_size_m}m). Ideální pro kontrolu hotového díla.")
                 
-                # Výpočet Mřížky pro diferenci
+                # Výpočet Mřížky pro finální hodnoty
                 lat_step = grid_size_m / 111320
                 lon_step = grid_size_m / (111320 * np.cos(np.radians(avg_lat)))
                 df_current['lat_bin'] = (df_current['corr_lat'] // lat_step) * lat_step + (lat_step / 2)
                 df_current['lon_bin'] = (df_current['corr_lon'] // lon_step) * lon_step + (lon_step / 2)
                 
+                # Seřazení podle času zaručí, že funkce 'last' vezme opravdu poslední pojezd v daném bodě
                 df_current = df_current.sort_values('parsed_time')
-                df_diff = df_current.groupby(['lat_bin', 'lon_bin']).agg(
-                    First_Kb=(col_stiff, 'first'),
+                df_final = df_current.groupby(['lat_bin', 'lon_bin']).agg(
                     Last_Kb=(col_stiff, 'last'),
                     Pass_Count=('pass_id', 'nunique')
                 ).reset_index()
                 
-                # Výpočet přírůstku
-                df_diff['Delta_Kb'] = df_diff['Last_Kb'] - df_diff['First_Kb']
-                # Body s pouze 1 pojezdem nemají přírůstek
-                df_diff.loc[df_diff['Pass_Count'] == 1, 'Delta_Kb'] = 0 
+                fig_final = go.Figure()
                 
-                fig_diff = go.Figure()
-                
-                # Diverging colormap: Červená (záporné), Bílá/Šedá (Nula), Modrá/Zelená (Kladné)
-                fig_diff.add_trace(go.Scatter(
-                    x=df_diff['lon_bin'], y=df_diff['lat_bin'], mode='markers',
+                fig_final.add_trace(go.Scatter(
+                    x=df_final['lon_bin'], y=df_final['lat_bin'], mode='markers',
                     marker=dict(
-                        symbol='square', size=15, opacity=0.8,
-                        color=df_diff['Delta_Kb'], 
-                        colorscale='RdBu', # Red to Blue (Zero is white/gray)
-                        cmin=-15, cmax=15, # Symetrický rozsah kolem nuly
-                        showscale=True, colorbar=dict(title="Δ Kb")
+                        symbol='square', size=15, opacity=0.9,
+                        color=df_final['Last_Kb'], 
+                        colorscale=colormap,
+                        showscale=True, colorbar=dict(title="Finální Kb [-]")
                     ),
-                    hovertext="Δ Kb: " + df_diff['Delta_Kb'].round(1).astype(str) + " (Průjezdů: " + df_diff['Pass_Count'].astype(str) + ")"
+                    hovertext="Finální Kb: " + df_final['Last_Kb'].round(1).astype(str) + " (Průjezdů: " + df_final['Pass_Count'].astype(str) + ")"
                 ))
-                fig_diff.update_layout(yaxis=dict(scaleanchor="x", scaleratio=cos_correction), height=700, dragmode='pan', margin=dict(l=0, r=0, t=30, b=0))
-                st.plotly_chart(fig_diff, use_container_width=True)
+                fig_final.update_layout(yaxis=dict(scaleanchor="x", scaleratio=cos_correction), height=700, dragmode='pan', margin=dict(l=0, r=0, t=30, b=0))
+                st.plotly_chart(fig_final, use_container_width=True)
 
             with tab3:
                 st.subheader(f"Mapa Anomálií (Po pojezdu {selected_pass})")
