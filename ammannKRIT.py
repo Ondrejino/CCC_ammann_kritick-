@@ -185,7 +185,12 @@ if uploaded_file is not None:
                 marker=dict(size=6, color=df_vib[col_stiff], colorscale=colormap, showscale=True, opacity=0.7, colorbar=dict(title="Kb [-]")),
                 hovertext="Pojezd: " + df_vib['pass_id'].astype(str) + " | Kb: " + df_vib[col_stiff].round(1).astype(str)
             ))
-            fig_raw.update_layout(yaxis=dict(scaleanchor="x", scaleratio=cos_correction), height=700, dragmode='pan', margin=dict(l=0, r=0, t=30, b=0))
+            # PŘIDÁNO: tickformat a hoverformat pro x i y
+            fig_raw.update_layout(
+                xaxis=dict(tickformat=".7f", hoverformat=".7f"),
+                yaxis=dict(scaleanchor="x", scaleratio=cos_correction, tickformat=".7f", hoverformat=".7f"), 
+                height=700, dragmode='pan', margin=dict(l=0, r=0, t=30, b=0)
+            )
             st.plotly_chart(fig_raw, use_container_width=True)
 
         with tab2:
@@ -206,7 +211,12 @@ if uploaded_file is not None:
                 ),
                 hovertext="Finální Kb: " + df_final['Last_Kb'].round(1).astype(str) + " (Vib. průjezdů: " + df_final['Vib_Pass_Count'].astype(str) + ")"
             ))
-            fig_final.update_layout(yaxis=dict(scaleanchor="x", scaleratio=cos_correction), height=700, dragmode='pan', margin=dict(l=0, r=0, t=30, b=0))
+            # PŘIDÁNO: tickformat a hoverformat pro x i y
+            fig_final.update_layout(
+                xaxis=dict(tickformat=".7f", hoverformat=".7f"),
+                yaxis=dict(scaleanchor="x", scaleratio=cos_correction, tickformat=".7f", hoverformat=".7f"), 
+                height=700, dragmode='pan', margin=dict(l=0, r=0, t=30, b=0)
+            )
             st.plotly_chart(fig_final, use_container_width=True)
 
         with tab3:
@@ -235,7 +245,12 @@ if uploaded_file is not None:
                     hovertext="Kb: " + df_over[col_stiff].round(1).astype(str)
                 ))
             
-            fig_anom.update_layout(yaxis=dict(scaleanchor="x", scaleratio=cos_correction), height=700, dragmode='pan', margin=dict(l=0, r=0, t=30, b=0))
+            # PŘIDÁNO: tickformat a hoverformat pro x i y
+            fig_anom.update_layout(
+                xaxis=dict(tickformat=".7f", hoverformat=".7f"),
+                yaxis=dict(scaleanchor="x", scaleratio=cos_correction, tickformat=".7f", hoverformat=".7f"), 
+                height=700, dragmode='pan', margin=dict(l=0, r=0, t=30, b=0)
+            )
             st.plotly_chart(fig_anom, use_container_width=True)
 
         with tab4:
@@ -274,7 +289,12 @@ if uploaded_file is not None:
                 hovertext=labels_iron + " | Celkem pojezdů zde: " + df_ironing['Total_Passes'].astype(str)
             ))
             
-            fig_iron.update_layout(yaxis=dict(scaleanchor="x", scaleratio=cos_correction), height=700, dragmode='pan', margin=dict(l=0, r=0, t=30, b=0), showlegend=False)
+            # PŘIDÁNO: tickformat a hoverformat pro x i y
+            fig_iron.update_layout(
+                xaxis=dict(tickformat=".7f", hoverformat=".7f"),
+                yaxis=dict(scaleanchor="x", scaleratio=cos_correction, tickformat=".7f", hoverformat=".7f"), 
+                height=700, dragmode='pan', margin=dict(l=0, r=0, t=30, b=0), showlegend=False
+            )
             st.plotly_chart(fig_iron, use_container_width=True)
             
             total_area_cells = len(df_ironing)
