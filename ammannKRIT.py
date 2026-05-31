@@ -10,8 +10,8 @@ import csv
 
 # --- 1. NASTAVENÍ APLIKACE ---
 st.set_page_config(page_title="CCC Detektor: Finální Rasterizace", layout="wide")
-st.title("🚜 CCC Detektor: Profesionální plošná rasterizace (V6)")
-st.caption("Aplikace optimalizovaná pro inženýrskou praxi (Zeminy F6, břidlice). Provádí reálnou rasterizaci šířky běhounu, výpočet překryvů a odšumění dat.")
+st.title(" CCC Detektor ")
+st.caption("Hahaha")
 
 # --- 2. DATA PARSER ---
 @st.cache_data(show_spinner="Analyzuji hlavičky a načítám surová data...")
@@ -43,7 +43,6 @@ def najdi_vychozi_sloupec(columns, klicova_slova):
 
 # --- 3. GEODETICKÉ JÁDRO & POLYGONY ---
 def vytvor_geometrii_pasu(df_geom, width_m):
-    """Vektorizovaný výpočet rohů válce na elipsoidu WGS84 s dynamickou délkou."""
     geod = Geod(ellps="WGS84")
     lon, lat, heading = df_geom['drum_lon'].values, df_geom['drum_lat'].values, df_geom['heading'].values
     length_array = df_geom['step_dist'].values
@@ -103,7 +102,6 @@ def zpracuj_geodata(df_raw, col_lat, col_lon, col_stiff, col_vib, col_time, col_
         time_gap = df_valid['parsed_time'].diff().dt.total_seconds() > 30
         df_valid['pass_id'] = (time_gap | dir_cond).cumsum() + 1
         
-        # Generování WGS84 rohů pro rasterizaci
         c1x, c1y, c2x, c2y, c3x, c3y, c4x, c4y = vytvor_geometrii_pasu(df_valid, roller_width)
         df_valid['c1x'], df_valid['c1y'] = c1x, c1y
         df_valid['c2x'], df_valid['c2y'] = c2x, c2y
@@ -118,7 +116,6 @@ def rasterizuj_do_mrizky(df, grid_size, avg_lat, col_stiff):
     df_work = df[['c1x', 'c1y', 'c2x', 'c2y', 'c3x', 'c3y', 'c4x', 'c4y', 'pass_id', 'is_vibrating', col_stiff, 'parsed_time']].copy()
     df_work.columns = ['c1x', 'c1y', 'c2x', 'c2y', 'c3x', 'c3y', 'c4x', 'c4y', 'pass_id', 'is_vib', 'kb', 'time']
     
-    # Lokální metrický grid pro rychlé výpočty
     lat_f = 111320.0
     lon_f = 111320.0 * np.cos(np.radians(avg_lat))
     
@@ -134,12 +131,10 @@ def rasterizuj_do_mrizky(df, grid_size, avg_lat, col_stiff):
     
     raster_records = []
     
-    # Průchod přes všechny zaznamenané polygony
     for i in range(len(df_work)):
         xs = [c1x_m[i], c2x_m[i], c3x_m[i], c4x_m[i]]
         ys = [c1y_m[i], c2y_m[i], c3y_m[i], c4y_m[i]]
         
-        # Bounding box pro polygon
         min_x, max_x = min(xs), max(xs)
         min_y, max_y = min(ys), max(ys)
         
@@ -156,7 +151,6 @@ def rasterizuj_do_mrizky(df, grid_size, avg_lat, col_stiff):
         xx, yy = np.meshgrid(g_xs + grid_size/2, g_ys + grid_size/2)
         pts = np.column_stack((xx.flatten(), yy.flatten()))
         
-        # Maska: Které buňky mřížky jsou protnuty tímto polygonem?
         mask = poly_path.contains_points(pts)
         inside_pts = pts[mask]
         
@@ -172,16 +166,13 @@ def rasterizuj_do_mrizky(df, grid_size, avg_lat, col_stiff):
             
     df_raster = pd.DataFrame(raster_records)
     
-    # AGREGACE: Vyhlazení dat v buňce
     if not df_raster.empty:
-        # 1. Průměr v rámci jednoho pojezdu (Vyhladí skákání válce na kameni)
         df_pass_avg = df_raster.groupby(['grid_x_m', 'grid_y_m', 'pass_id']).agg({
             'kb': 'mean',
-            'is_vib': 'max',  # Pokud alespoň jednou v pojezdu vibroval = vibrační pojezd
+            'is_vib': 'max',
             'time': 'max'
         }).reset_index()
         
-        # Zpětný převod středů buněk mřížky na WGS84
         df_pass_avg['cell_lon'] = (df_pass_avg['grid_x_m'] + grid_size/2) / lon_f
         df_pass_avg['cell_lat'] = (df_pass_avg['grid_y_m'] + grid_size/2) / lat_f
         return df_pass_avg
@@ -205,8 +196,9 @@ with st.sidebar:
         col_speed = st.selectbox("Rychlost", ["Vypočítat z GPS"] + list(df_raw.columns), index=0)
 
         st.header("📐 3. Stroj a Rastrování")
-        offset_fwd = st.number_input("Posun antény podélně (m)", value=2.0, step=0.1)
-        offset_right = st.number_input("Posun antény příčně (m)", value=0.0, step=0.1, help="Kladné = doprava, Záporné = doleva")
+        # Výchozí hodnoty nastaveny podle požadavku (2.65 dopředu, 0.26 do boku)
+        offset_fwd = st.number_input("Posun antény podélně (m)", value=2.65, step=0.05)
+        offset_right = st.number_input("Posun antény příčně (m)", value=0.26, step=0.01, help="Kladné = doprava, Záporné = doleva")
         roller_width = st.number_input("Šířka běhounu (m)", value=2.13, step=0.01)
         grid_size = st.slider("Přesnost Mřížky/Rasteru (m)", 0.2, 1.0, 0.5, 0.1)
         min_speed_kmh = st.number_input("Filtr stání (km/h)", value=0.5, step=0.1)
@@ -220,7 +212,6 @@ with st.sidebar:
 def generuj_mrizku_trace(df_grid, cell_size_m, avg_lat, color_val, color_scale, zmin, zmax, name):
     if df_grid.empty: return None
     
-    # Výpočet rohů mřížkového čtverce zpět do WGS84
     lat_f = 111320.0
     lon_f = 111320.0 * np.cos(np.radians(avg_lat))
     dx = (cell_size_m / 2) / lon_f
@@ -246,7 +237,7 @@ def generuj_mrizku_trace(df_grid, cell_size_m, avg_lat, color_val, color_scale, 
     if isinstance(color_val, str): fill_color = color_val
     else: fill_color = sample_colorscale(color_scale, [np.clip((color_val - zmin) / (zmax - zmin) if zmax > zmin else 0, 0, 1)])[0]
 
-    return go.Scatter(x=x_flat, y=y_flat, fill='toself', mode='lines', line=dict(width=0), fillcolor=fill_color, opacity=0.9, name=name, hoverinfo='skip')
+    return go.Scatter(x=x_flat, y=y_flat, fill='toself', mode='lines', line=dict(width=0), fillcolor=fill_color, opacity=0.9, name=name, hoverinfo='skip', showlegend=False)
 
 # --- 7. HLAVNÍ LOGIKA ---
 if uploaded_file is not None:
@@ -265,7 +256,7 @@ if uploaded_file is not None:
         map_layout = dict(scaleanchor="x", scaleratio=cos_corr, tickformat=".7f", hoverformat=".7f")
 
         tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-            "🗺️ 1. Raw Trasa", "🔥 2. Překryvy (Pass Count)", "🟩 3. Finální Tuhost", "🔴 4. Anomálie", "📊 5. Statistika", "🧊 6. Žehlení"
+            "🗺️ 1. Raw Trasa", "🔥 2. Překryvy", "🟩 3. Finální Tuhost", "🔴 4. Anomálie (Bodově)", "📊 5. Statistika", "🧊 6. Žehlení"
         ])
 
         with tab1:
@@ -275,7 +266,7 @@ if uploaded_file is not None:
             if not df_v.empty:
                 fig1.add_trace(go.Scattergl(
                     x=df_v['drum_lon'], y=df_v['drum_lat'], mode='markers',
-                    marker=dict(size=4, color=df_v[col_stiff], colorscale=colormap, showscale=True),
+                    marker=dict(size=4, color=df_v[col_stiff], colorscale=colormap, showscale=True, colorbar=dict(title="Kb [-]")),
                     hovertext="Kb: " + df_v[col_stiff].round(1).astype(str)
                 ))
             fig1.update_layout(yaxis=map_layout, height=700, margin=dict(l=0,r=0,t=0,b=0))
@@ -283,34 +274,32 @@ if uploaded_file is not None:
 
         with tab2:
             st.subheader("Mapa překryvů (Pass Count)")
-            st.caption("Počet nezávislých přejezdů stroje přes každou buňku stavby (Klíčové pro technologický dozor).")
             fig2 = go.Figure()
             if not df_current_raster.empty:
-                # Kolik unikátních pass_id dopadlo na každou buňku
                 df_counts = df_current_raster.groupby(['cell_lon', 'cell_lat'])['pass_id'].nunique().reset_index(name='pass_count')
-                
                 max_count = df_counts['pass_count'].max()
                 for c in range(1, max_count + 1):
                     df_c = df_counts[df_counts['pass_count'] == c]
                     trace = generuj_mrizku_trace(df_c, grid_size, avg_lat, c, 'hot', 0, max_count + 1, f"{c} Přejezdů")
-                    if trace: fig2.add_trace(trace)
-                
+                    # Přepsání showlegend pro tabulku překryvů, abychom viděli barvy
+                    if trace: 
+                        trace.showlegend = True
+                        fig2.add_trace(trace)
+                        
                 fig2.add_trace(go.Scattergl(
                     x=df_counts['cell_lon'], y=df_counts['cell_lat'], mode='markers', marker=dict(size=2, opacity=0.01, color='black'),
-                    hovertext="Počet přejezdů: " + df_counts['pass_count'].astype(str) + "<br>Lat: " + df_counts['cell_lat'].round(7).astype(str) + "<br>Lon: " + df_counts['cell_lon'].round(7).astype(str)
+                    hovertext="Počet přejezdů: " + df_counts['pass_count'].astype(str) + "<br>Lat: " + df_counts['cell_lat'].round(7).astype(str) + "<br>Lon: " + df_counts['cell_lon'].round(7).astype(str),
+                    showlegend=False
                 ))
             fig2.update_layout(yaxis=map_layout, height=700, margin=dict(l=0,r=0,t=0,b=0), showlegend=True)
             st.plotly_chart(fig2, use_container_width=True)
 
         with tab3:
             st.subheader("Finální povrchová tuhost (Kb)")
-            st.caption("Do mapy vstupuje zprůměrovaná hodnota vždy z časově POSLEDNÍHO pojezdu v dané buňce.")
             fig3 = go.Figure()
             if not df_current_raster.empty:
-                # 1. Získáme jen vibrační pojezdy
                 df_vib_raster = df_current_raster[df_current_raster['is_vib'] == True]
                 if not df_vib_raster.empty:
-                    # 2. Vybíráme absolutně poslední čas (finální vrstvu)
                     idx_last = df_vib_raster.groupby(['cell_lon', 'cell_lat'])['time'].idxmax()
                     df_final = df_vib_raster.loc[idx_last].copy()
                     
@@ -323,29 +312,43 @@ if uploaded_file is not None:
                         val_center = zmin + (b + 0.5) * ((zmax - zmin) / bins)
                         trace = generuj_mrizku_trace(df_bin, grid_size, avg_lat, val_center, colormap, zmin, zmax, f"Kb ~{val_center:.0f}")
                         if trace: fig3.add_trace(trace)
+                    
+                    # Trik pro zobrazení plynulé legendy (Colorbar) k polygonům
+                    fig3.add_trace(go.Scatter(
+                        x=[None], y=[None], mode='markers',
+                        marker=dict(colorscale=colormap, cmin=zmin, cmax=zmax, showscale=True, colorbar=dict(title="Kb [-]")),
+                        showlegend=False, hoverinfo='none'
+                    ))
                         
                     fig3.add_trace(go.Scattergl(
                         x=df_final['cell_lon'], y=df_final['cell_lat'], mode='markers', marker=dict(size=2, opacity=0.01, color='black'),
-                        hovertext="Kb (Vyhlazeno): " + df_final['kb'].round(1).astype(str) + "<br>Lat: " + df_final['cell_lat'].round(7).astype(str) + "<br>Lon: " + df_final['cell_lon'].round(7).astype(str)
+                        hovertext="Kb (Vyhlazeno): " + df_final['kb'].round(1).astype(str) + "<br>Lat: " + df_final['cell_lat'].round(7).astype(str) + "<br>Lon: " + df_final['cell_lon'].round(7).astype(str),
+                        showlegend=False
                     ))
             fig3.update_layout(yaxis=map_layout, height=700, margin=dict(l=0,r=0,t=0,b=0), showlegend=False)
             st.plotly_chart(fig3, use_container_width=True)
 
         with tab4:
-            st.subheader("Anomálie z finální plochy")
+            st.subheader("Anomálie z finální plochy (Přesné body)")
+            st.caption("Plocha je vykreslena bodově pro snadné zacílení a vytyčení souřadnic s přesností na 7 desetinných míst.")
             fig4 = go.Figure()
             if not df_current_raster.empty and not df_vib_raster.empty:
                 df_under = df_final[df_final['kb'] < target_min]
                 df_over = df_final[df_final['kb'] > target_max]
                 df_ok = df_final[(df_final['kb'] >= target_min) & (df_final['kb'] <= target_max)]
                 
-                t_ok = generuj_mrizku_trace(df_ok, grid_size, avg_lat, '#E5E7EB', colormap, 0, 1, "V normě")
-                t_under = generuj_mrizku_trace(df_under, grid_size, avg_lat, 'rgba(239, 68, 68, 0.9)', colormap, 0, 1, "Nedohutněno")
-                t_over = generuj_mrizku_trace(df_over, grid_size, avg_lat, 'rgba(59, 130, 246, 0.9)', colormap, 0, 1, "Přezhutněno")
-                
-                for t in [t_ok, t_under, t_over]:
-                    if t: fig4.add_trace(t)
-            fig4.update_layout(yaxis=map_layout, height=700, margin=dict(l=0,r=0,t=0,b=0))
+                # Zobrazení anomálií jako bodů (Scatter) s přesným textem místo plošných čtverečků
+                if not df_ok.empty:
+                    fig4.add_trace(go.Scattergl(x=df_ok['cell_lon'], y=df_ok['cell_lat'], mode='markers', marker=dict(color='#E5E7EB', size=6), name="V normě",
+                        hovertext="Lat: " + df_ok['cell_lat'].round(7).astype(str) + "<br>Lon: " + df_ok['cell_lon'].round(7).astype(str) + "<br>Kb: " + df_ok['kb'].round(1).astype(str)))
+                if not df_under.empty:
+                    fig4.add_trace(go.Scattergl(x=df_under['cell_lon'], y=df_under['cell_lat'], mode='markers', marker=dict(color='rgba(239, 68, 68, 0.9)', size=7), name="Nedohutněno",
+                        hovertext="Lat: " + df_under['cell_lat'].round(7).astype(str) + "<br>Lon: " + df_under['cell_lon'].round(7).astype(str) + "<br>Kb: " + df_under['kb'].round(1).astype(str)))
+                if not df_over.empty:
+                    fig4.add_trace(go.Scattergl(x=df_over['cell_lon'], y=df_over['cell_lat'], mode='markers', marker=dict(color='rgba(59, 130, 246, 0.9)', size=7), name="Přezhutněno",
+                        hovertext="Lat: " + df_over['cell_lat'].round(7).astype(str) + "<br>Lon: " + df_over['cell_lon'].round(7).astype(str) + "<br>Kb: " + df_over['kb'].round(1).astype(str)))
+
+            fig4.update_layout(yaxis=map_layout, height=700, margin=dict(l=0,r=0,t=0,b=0), showlegend=True)
             st.plotly_chart(fig4, use_container_width=True)
 
         with tab5:
@@ -358,13 +361,9 @@ if uploaded_file is not None:
 
         with tab6:
             st.subheader("Chronologická kontrola uzavření povrchu")
-            st.caption("Každá buňka ověřuje: 'Byla má poslední interakce statické žehlení po tom, co jsem někdy v minulosti prožila vibraci?'")
             fig6 = go.Figure()
             if not df_current_raster.empty:
-                # Extrakce času nejnovější vibrace v dané buňce
                 vib_times = df_current_raster[df_current_raster['is_vib'] == True].groupby(['cell_lon', 'cell_lat'])['time'].max()
-                
-                # Extrakce úplně posledního pojezdu v dané buňce
                 idx_all_last = df_current_raster.groupby(['cell_lon', 'cell_lat'])['time'].idxmax()
                 df_last_any = df_current_raster.loc[idx_all_last].copy().set_index(['cell_lon', 'cell_lat'])
                 
@@ -378,15 +377,21 @@ if uploaded_file is not None:
                 t_green = generuj_mrizku_trace(df_green, grid_size, avg_lat, 'rgba(34, 197, 94, 0.85)', colormap, 0, 1, "Uzavřeno (Statika na závěr)")
                 t_red = generuj_mrizku_trace(df_red, grid_size, avg_lat, 'rgba(239, 68, 68, 0.85)', colormap, 0, 1, "Riziko (Zůstalo po vibraci)")
                 
-                if t_green: fig6.add_trace(t_green)
-                if t_red: fig6.add_trace(t_red)
+                if t_green:
+                    t_green.showlegend = True
+                    fig6.add_trace(t_green)
+                if t_red:
+                    t_red.showlegend = True
+                    fig6.add_trace(t_red)
                 
                 fig6.add_trace(go.Scattergl(
                     x=df_last_any['cell_lon'], y=df_last_any['cell_lat'], mode='markers', marker=dict(size=2, opacity=0.01, color='black'),
-                    hovertext="Stav uzavření<br>Lat: " + df_last_any['cell_lat'].round(7).astype(str) + "<br>Lon: " + df_last_any['cell_lon'].round(7).astype(str)
+                    hovertext="Stav uzavření<br>Lat: " + df_last_any['cell_lat'].round(7).astype(str) + "<br>Lon: " + df_last_any['cell_lon'].round(7).astype(str),
+                    showlegend=False
                 ))
 
-            fig6.update_layout(yaxis=map_layout, height=700, margin=dict(l=0,r=0,t=0,b=0), showlegend=False)
+            # Zapnutí zobrazení legendy u žehlení
+            fig6.update_layout(yaxis=map_layout, height=700, margin=dict(l=0,r=0,t=0,b=0), showlegend=True, legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01))
             st.plotly_chart(fig6, use_container_width=True)
 
     else:
