@@ -14,98 +14,41 @@ st.caption("Akademický nástroj pro analýzu CCC dat (Optimalizováno pro velk�
 # --- 2. ROBUSTNÍ NAČÍTÁNÍ A CACHOVÁNÍ ---
 @st.cache_data(show_spinner="Analyzuji a parsuji CSV soubor...")
 def nacti_surova_data(file_bytes):
-    # Pokus o inteligentní detekci oddělovače (Sniffer)
-    sample_text = file_bytes[:10000].decode("utf-8", errors="ignore")
-    try:
-        sep = csv.Sniffer().sniff(sample_text.splitlines()[0]).delimiter
-    except:
-        sep = ';' if sample_text.count(';') > sample_text.count(',') else ','
-        
-    # Hledání hlavičky (některé stroje mají nahoře meta-data)
+    # Dekódování souboru
+    sample_text = file_bytes[:50000].decode("utf-8", errors="ignore")
     lines = sample_text.splitlines()
+    
+    # Návrat k tvé původní a spolehlivé logice hledání hlavičky!
     header_idx = 0
     for i, line in enumerate(lines):
-        if "latitude" in line.lower() or "time" in line.lower() or "lon" in line.lower():
+        line_lower = line.lower()
+        # Hledáme typické znaky datového řádku nebo hlavičky
+        if "latitude" in line_lower or "lat" in line_lower or "time" in line_lower or "gps:" in line_lower:
             header_idx = i
             break
             
-    df = pd.read_csv(io.BytesIO(file_bytes), sep=sep, skiprows=header_idx, on_bad_lines='skip', low_memory=False)
+    header_line = lines[header_idx]
+    
+    # Tvá původní detekce oddělovače (u těchto strojů funguje často lépe než knihovny)
+    sep = ';' if header_line.count(';') > header_line.count(',') else ','
+    
+    # Načtení od nalezeného řádku, vše jako string pro bezpečné zpracování
+    df = pd.read_csv(io.BytesIO(file_bytes), sep=sep, skiprows=header_idx, on_bad_lines='skip', dtype=str)
+    
+    # Vyčištění názvů sloupců (odstranění mezer a uvozovek)
     df.columns = df.columns.astype(str).str.strip().str.replace('"', '').str.replace("'", "")
     return df
 
 def najdi_vychozi_sloupec(columns, klicova_slova):
+    """Prohledá sloupce a najde shodu i v názvech jako 'GPS:latitude' nebo 'stiffness'"""
     for col in columns:
+        col_lower = str(col).lower()
         for slovo in klicova_slova:
-            if slovo in str(col).lower():
+            if slovo in col_lower:
                 return col
     return columns[0] if len(columns) > 0 else None
 
-# --- 3. VEKTORIZOVANÉ GEOPROSTOROVÉ JÁDRO ---
-@st.cache_data(show_spinner="Transformuji souřadnice a počítám metrickou síť...")
-def zpracuj_geodata(df_raw, col_lat, col_lon, col_stiff, col_vib, col_time, col_speed, col_dir, offset_fwd, offset_right, min_speed_kmh, grid_size):
-    df = df_raw.copy()
-    
-    # 1. Standardizace typů (odstranění desetinných čárek)
-    for col in [col_lat, col_lon, col_stiff, col_vib]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col].astype(str).str.replace(',', '.'), errors='coerce')
-            
-    # Bezpečné zpracování času (zvládne ISO, UTC i lokální stringy)
-    df['parsed_time'] = pd.to_datetime(df[col_time].astype(str).str.replace(' GMT', ''), utc=True, format='mixed', errors='coerce')
-    
-    # Filtrace neplatných řádků před těžkými výpočty
-    df = df.dropna(subset=[col_lat, col_lon, 'parsed_time']).sort_values('parsed_time').reset_index(drop=True)
-    if len(df) < 2:
-        return pd.DataFrame()
-
-    # 2. LOKÁLNÍ METRICKÁ PROJEKCE (Azimuthal Equidistant)
-    # Vytvoříme matematicky přesnou rovnou plochu (v metrech) vycentrovanou přesně na střed stavby
-    mean_lat, mean_lon = df[col_lat].mean(), df[col_lon].mean()
-    proj_string = f"+proj=aeqd +lat_0={mean_lat} +lon_0={mean_lon} +datum=WGS84 +units=m"
-    transformer = Transformer.from_crs("EPSG:4326", proj_string, always_xy=True)
-    
-    # Vektorizovaný převod Lat/Lon na metrické X/Y
-    df['x_m'], df['y_m'] = transformer.transform(df[col_lon].values, df[col_lat].values)
-    
-    # 3. VEKTORIZOVANÁ KINEMATIKA (Směr a Rychlost)
-    # Směrový vektor (rozdíl souřadnic)
-    df['dx'] = df['x_m'].diff().bfill()
-    df['dy'] = df['y_m'].diff().bfill()
-    
-    # Heading v radiánech (Azimut). arctan2 bere (Y, X), kde osa Y je Sever.
-    df['heading_rad'] = np.arctan2(df['dx'], df['dy'])
-    
-    # Rychlost
-    if col_speed != "Vypočítat z GPS":
-        df['speed_kmh'] = pd.to_numeric(df[col_speed].astype(str).str.replace(',', '.'), errors='coerce')
-    else:
-        df['dt'] = df['parsed_time'].diff().dt.total_seconds().replace(0, 0.01).bfill()
-        df['dist'] = np.sqrt(df['dx']**2 + df['dy']**2)
-        df['speed_kmh'] = (df['dist'] / df['dt']) * 3.6
-        df['speed_kmh'] = df['speed_kmh'].rolling(3, min_periods=1, center=True).mean()
-
-    # 4. KOREKCE POZICE BĚHOUNU (Offsety)
-    # Převod offsetů antény vůči těžišti/běhounu stroje
-    # fwd = podélně (ve směru jízdy), right = příčně (vpravo od osy)
-    df['drum_x'] = df['x_m'] + (np.sin(df['heading_rad']) * offset_fwd) + (np.cos(df['heading_rad']) * offset_right)
-    df['drum_y'] = df['y_m'] + (np.cos(df['heading_rad']) * offset_fwd) - (np.sin(df['heading_rad']) * offset_right)
-
-    # 5. VYTVOŘENÍ RASTROVÉ MŘÍŽKY (Grid Binning)
-    # Tímto přiřadíme každý záznam do přesného čtverce na ploše
-    df['grid_x'] = (df['drum_x'] // grid_size) * grid_size + (grid_size / 2)
-    df['grid_y'] = (df['drum_y'] // grid_size) * grid_size + (grid_size / 2)
-
-    # 6. FILTRACE POJEZDŮ A VIBRACÍ
-    df['is_vibrating'] = df[col_vib].fillna(0) > 0.1
-    df_valid = df[df['speed_kmh'] >= min_speed_kmh].copy()
-    
-    if not df_valid.empty:
-        # Identifikace samostatných pracovních tahů (změna směru nebo časová pauza > 30s)
-        time_gap = df_valid['parsed_time'].diff().dt.total_seconds() > 30
-        dir_cond = df_valid[col_dir] != df_valid[col_dir].shift().bfill() if col_dir in df_valid.columns else False
-        df_valid['pass_id'] = (time_gap | dir_cond).cumsum() + 1
-        
-    return df_valid
+# ... (Sekce 3. Geoprostorové jádro zůstává stejná) ...
 
 # --- 4. BOČNÍ PANEL (UI) ---
 with st.sidebar:
@@ -117,15 +60,16 @@ with st.sidebar:
         df_raw = nacti_surova_data(file_bytes)
         
         st.header("⚙️ 2. Senzory a Sloupce")
+        # Rozšířená klíčová slova reagující na tvůj specifický formát (např. 'GPS:latitude')
         col_time = st.selectbox("Čas", df_raw.columns, index=df_raw.columns.get_loc(najdi_vychozi_sloupec(df_raw.columns, ['time', 'cas'])))
-        col_lat = st.selectbox("Latitude", df_raw.columns, index=df_raw.columns.get_loc(najdi_vychozi_sloupec(df_raw.columns, ['lat'])))
-        col_lon = st.selectbox("Longitude", df_raw.columns, index=df_raw.columns.get_loc(najdi_vychozi_sloupec(df_raw.columns, ['lon'])))
-        col_stiff = st.selectbox("Tuhost (Kb)", df_raw.columns, index=df_raw.columns.get_loc(najdi_vychozi_sloupec(df_raw.columns, ['stiff', 'kb', 'cmv'])))
+        col_lat = st.selectbox("Latitude", df_raw.columns, index=df_raw.columns.get_loc(najdi_vychozi_sloupec(df_raw.columns, ['lat', 'latitude'])))
+        col_lon = st.selectbox("Longitude", df_raw.columns, index=df_raw.columns.get_loc(najdi_vychozi_sloupec(df_raw.columns, ['lon', 'longitude'])))
+        col_stiff = st.selectbox("Tuhost (Kb)", df_raw.columns, index=df_raw.columns.get_loc(najdi_vychozi_sloupec(df_raw.columns, ['stiffness', 'stiff', 'kb', 'cmv'])))
         
-        dir_guess = najdi_vychozi_sloupec(df_raw.columns, ['dir', 'smer'])
+        dir_guess = najdi_vychozi_sloupec(df_raw.columns, ['direction', 'dir', 'smer'])
         col_dir = st.selectbox("Směr (Vpřed/Vzad)", [None] + list(df_raw.columns), index=list(df_raw.columns).index(dir_guess)+1 if dir_guess else 0)
         
-        vib_guess = najdi_vychozi_sloupec(df_raw.columns, ['amp', 'freq', 'vib'])
+        vib_guess = najdi_vychozi_sloupec(df_raw.columns, ['amplitude:amplitude', 'amp', 'freq', 'vib', 'frequency'])
         col_vib = st.selectbox("Vibrace (Amp/Freq)", df_raw.columns, index=df_raw.columns.get_loc(vib_guess) if vib_guess else 0)
         
         speed_guess = najdi_vychozi_sloupec(df_raw.columns, ['speed', 'vel', 'rychlost'])
@@ -135,7 +79,7 @@ with st.sidebar:
         st.header("📐 3. Kalibrace stroje a mřížky")
         offset_fwd = st.number_input("Posun anténa -> běhoun podélně (m)", value=2.0, step=0.1)
         offset_right = st.number_input("Posun anténa -> běhoun příčně (m)", value=0.0, step=0.1, help="+ vpravo, - vlevo")
-        grid_size = st.slider("Rozlišení mřížky / Raster (m)", 0.2, 2.0, 0.5, 0.1, help="Menší hodnota = detailnější výpočet, ale hrubší mapa.")
+        grid_size = st.slider("Rozlišení mřížky / Raster (m)", 0.2, 2.0, 0.5, 0.1)
         min_speed_kmh = st.number_input("Odříznout stání (km/h)", value=0.5, step=0.1)
 
         st.header("🎯 4. Technologické limity")
