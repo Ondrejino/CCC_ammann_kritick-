@@ -1,4 +1,4 @@
-code_content = """import streamlit as st
+import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
@@ -35,12 +35,12 @@ def najdi_vychozi_sloupec(columns, klicova_slova):
                 return col
     return columns[0] if len(columns) > 0 else None
 
-# --- OPRAVENO: CACHOVANÉ GEOPROSTOROVÉ ZPRACOVÁNÍ (Ponechává statická data bez Kb) ---
+# --- CACHOVANÉ GEOPROSTOROVÉ ZPRACOVÁNÍ ---
 @st.cache_data(show_spinner="Zpracovávám geodata, azimuty a pojezdy (počítá se jen jednou)...")
 def zpracuj_geodata(df_raw, col_lat, col_lon, col_stiff, col_vib, col_time, col_speed, col_dir, offset_m, offset_transverse_m, min_speed_kmh):
     df = df_raw.copy()
     
-    # Převody
+    # Převody s ochranou
     for col in [col_lat, col_lon, col_vib]:
         df[col] = pd.to_numeric(df[col].astype(str).str.replace(',', '.'), errors='coerce')
     
@@ -55,7 +55,7 @@ def zpracuj_geodata(df_raw, col_lat, col_lon, col_stiff, col_vib, col_time, col_
     else:
         df['speed_kmh'] = 0.0
 
-    # OPRAVA: Odstraněn col_stiff z dropna, abychom neztratili statické pojezdy bez hodnoty tuhosti
+    # ODSTRANĚNO col_stiff z dropna pro záchranu statických dat bez tuhosti
     df = df.dropna(subset=[col_lat, col_lon, 'parsed_time']).sort_values('parsed_time').reset_index(drop=True)
     
     if len(df) <= 5:
@@ -77,23 +77,21 @@ def zpracuj_geodata(df_raw, col_lat, col_lon, col_stiff, col_vib, col_time, col_
     is_forward = (df[col_dir].astype(str) == "1").values
     machine_heading = np.where(is_forward, fwd_az, (fwd_az + 180) % 360)
     
-    # --- MATEMATIKA L-tvaru (Korekce Anténa -> Běhoun) ---
+    # --- MATEMATIKA L-tvaru ---
     temp_lons, temp_lats, _ = geod.fwd(df[col_lon].values, df[col_lat].values, machine_heading, np.full(len(df), offset_m))
     transverse_heading = (machine_heading + 90) % 360
     new_lons, new_lats, _ = geod.fwd(temp_lons, temp_lats, transverse_heading, np.full(len(df), offset_transverse_m))
     
     df['corr_lon'], df['corr_lat'] = new_lons, new_lats
     
-    # Rychlost (Záložní)
     if col_speed == "Vypočítat z GPS (Záložní)":
         _, _, dist_step = geod.inv(df['corr_lon'].shift(), df['corr_lat'].shift(), df['corr_lon'], df['corr_lat'])
         time_step = df['parsed_time'].diff().dt.total_seconds().replace(0, 0.001)
         df['speed_kmh'] = (dist_step / time_step) * 3.6
         df['speed_kmh'] = df['speed_kmh'].rolling(3, min_periods=1).mean().bfill() 
     
-    # Očištění o stání a detekce pojezdů
+    # Detekce pojezdů
     df_valid = df[df['speed_kmh'] >= min_speed_kmh].copy()
-    
     if not df_valid.empty:
         time_gap_cond = df_valid['parsed_time'].diff().dt.total_seconds() > 30
         dir_cond = df_valid[col_dir] != df_valid[col_dir].shift().bfill()
@@ -143,12 +141,16 @@ if uploaded_file is not None:
     df_valid = zpracuj_geodata(df_raw, col_lat, col_lon, col_stiff, col_vib, col_time, col_speed, col_dir, offset_m, offset_transverse_m, min_speed_kmh)
     
     if not df_valid.empty:
-        max_pass = int(df_valid['pass_id'].max())
+        # BEZPEČNOSTNÍ POJISTKA 1: Převedení max_pass tak, aby slider nikdy nespadl
+        max_pass_val = df_valid['pass_id'].max(skipna=True)
+        max_pass = int(max_pass_val) if pd.notna(max_pass_val) else 1
+        slider_max = max_pass if max_pass > 1 else 2
+        
         avg_lat = df_valid['corr_lat'].mean()
         cos_correction = 1 / np.cos(np.radians(avg_lat))
 
         st.markdown("### ⏱️ Stroj času: Přehrávač hutnění")
-        selected_pass = st.slider("Zobrazit stav pojezdu (Vrstvy) do čísla:", min_value=1, max_value=max_pass, value=max_pass)
+        selected_pass = st.slider("Zobrazit stav pojezdu (Vrstvy) do čísla:", min_value=1, max_value=slider_max, value=max_pass)
         
         df_current = df_valid[df_valid['pass_id'] <= selected_pass].copy()
         
@@ -157,10 +159,10 @@ if uploaded_file is not None:
         df_current['lat_bin'] = (df_current['corr_lat'] // lat_step) * lat_step + (lat_step / 2)
         df_current['lon_bin'] = (df_current['corr_lon'] // lon_step) * lon_step + (lon_step / 2)
         
-        # OPRAVA: Pro mapy tuhosti bereme jen validní vibrační data s nenulovým Kb
+        # Ochrana pro heatmapy (jen platné vibrační hodnoty)
         df_vib = df_current[(df_current['is_vibrating'] == True) & (df_current[col_stiff].notna())].copy()
         
-        # NOVÉ / UPRAVENÉ: Analýza žehlení (úvodní i finální chronologicky na buňku)
+        # Analýza žehlení chronologicky
         df_current_sorted = df_current.sort_values('parsed_time')
         df_ironing = df_current_sorted.groupby(['lat_bin', 'lon_bin']).agg(
             First_Is_Vibrating=('is_vibrating', 'first'),
@@ -168,8 +170,9 @@ if uploaded_file is not None:
             Total_Passes=('pass_id', 'nunique')
         ).reset_index()
         
-        df_ironing['Is_Initial_Ironed'] = ~df_ironing['First_Is_Vibrating']
-        df_ironing['Is_Final_Ironed'] = ~df_ironing['Last_Is_Vibrating']
+        # BEZPEČNOSTNÍ POJISTKA 2: Místo vlnovky (~) používáme stabilní "== False"
+        df_ironing['Is_Initial_Ironed'] = df_ironing['First_Is_Vibrating'] == False
+        df_ironing['Is_Final_Ironed'] = df_ironing['Last_Is_Vibrating'] == False
 
         tab1, tab2, tab3, tab4, tab5 = st.tabs([
             "🕹️ 1. Simulace (Vibrace)", 
@@ -197,7 +200,7 @@ if uploaded_file is not None:
             st.plotly_chart(fig_raw, use_container_width=True)
 
         with tab2:
-            st.subheader(f"Mapa finální kvality (Poslední platné Kb)")
+            st.subheader("Mapa finální kvality (Poslední platné Kb)")
             fig_final = go.Figure()
             if not df_vib.empty:
                 df_vib_sorted = df_vib.sort_values('parsed_time')
@@ -283,7 +286,6 @@ if uploaded_file is not None:
             st.subheader("Analýza statického žehlení vrstvy")
             st.caption("Při statickém chodu bez vibrací stroje nezaznamenávají hodnotu tuhosti (Kb=NaN), avšak trajektorie pohybu je klíčová.")
             
-            # Přepínač pro zobrazení úvodního nebo finálního žehlení
             ironing_mode = st.radio(
                 "Vyberte typ technologické kontroly:",
                 ["Finální přežehlení (Uzavření povrchu proti srážkové vodě)", "Úvodní přežehlení (Stabilizace měkkého podkladu proti zaboření)"],
@@ -302,14 +304,19 @@ if uploaded_file is not None:
                 metric_title = "Plocha úvodně ošetřena před spuštěním vibrace"
 
             fig_iron = go.Figure()
-            colors_iron = np.where(df_ironing['Selected_Status'], '#22c55e', '#ef4444')
-            labels_iron = np.where(df_ironing['Selected_Status'], label_true, label_false)
             
-            fig_iron.add_trace(go.Scatter(
-                x=df_ironing['lon_bin'], y=df_ironing['lat_bin'], mode='markers',
-                marker=dict(symbol='square', size=15, opacity=0.9, color=colors_iron),
-                hovertext=labels_iron + " | Celkem pojezdů v buňce: " + df_ironing['Total_Passes'].astype(str)
-            ))
+            if not df_ironing.empty:
+                colors_iron = np.where(df_ironing['Selected_Status'], '#22c55e', '#ef4444')
+                labels_iron = np.where(df_ironing['Selected_Status'], label_true, label_false)
+                
+                # BEZPEČNOSTNÍ POJISTKA 3: Bezpečné vytváření popisků (zabrání Numpy/Pandas kolizi)
+                hover_text = [f"{lbl} | Celkem pojezdů v buňce: {pas}" for lbl, pas in zip(labels_iron, df_ironing['Total_Passes'])]
+                
+                fig_iron.add_trace(go.Scatter(
+                    x=df_ironing['lon_bin'], y=df_ironing['lat_bin'], mode='markers',
+                    marker=dict(symbol='square', size=15, opacity=0.9, color=colors_iron),
+                    hovertext=hover_text
+                ))
             
             fig_iron.update_layout(
                 xaxis=dict(tickformat=".7f", hoverformat=".7f"),
@@ -319,7 +326,7 @@ if uploaded_file is not None:
             st.plotly_chart(fig_iron, use_container_width=True)
             
             total_area_cells = len(df_ironing)
-            ironed_cells = df_ironing['Selected_Status'].sum()
+            ironed_cells = df_ironing['Selected_Status'].sum() if not df_ironing.empty else 0
             pct_ironed = (ironed_cells / total_area_cells * 100) if total_area_cells > 0 else 0
             
             st.metric(metric_title, f"{pct_ironed:.1f} %")
@@ -328,8 +335,3 @@ if uploaded_file is not None:
         st.error("Po odfiltrování nezbyla žádná data.")
 else:
     st.info("👋 Nahrajte CSV. Následně použijte slider pro přehrávání dat.")
-"""
-
-with open("ccc_detector_v2.py", "w", encoding="utf-8") as f:
-    f.write(code_content)
-print("File compiled successfully.")
