@@ -6,7 +6,7 @@ from pyproj import Geod
 import io
 
 # --- 1. NASTAVENÍ APLIKACE ---
-st.set_page_config(page_title="CCC Ultimátní Detektor v2", layout="wide")
+st.set_page_config(page_title="CCC Ultimátní Detektor v2.1", layout="wide")
 st.title("CCC Detektor: Komplexní analýza zhutnění")
 st.caption("Interaktivní přehrávání stavby vrstvu po vrstvě se sledováním úvodního i finálního statického žehlení.")
 
@@ -55,7 +55,7 @@ def zpracuj_geodata(df_raw, col_lat, col_lon, col_stiff, col_vib, col_time, col_
     else:
         df['speed_kmh'] = 0.0
 
-    # ODSTRANĚNO col_stiff z dropna pro záchranu statických dat bez tuhosti
+    # Záchrana statických dat (nevyhazujeme řádky bez col_stiff)
     df = df.dropna(subset=[col_lat, col_lon, 'parsed_time']).sort_values('parsed_time').reset_index(drop=True)
     
     if len(df) <= 5:
@@ -123,14 +123,15 @@ with st.sidebar:
         col_speed = st.selectbox("Sloupec RYCHLOSTI", speed_options, index=speed_options.index(speed_guess) if speed_guess else 0)
         
         st.header("3. Parametry stroje")
-        offset_m = st.number_input("Podélný posun anténa -> běhoun (m)", value=2.0, step=0.1)
-        offset_transverse_m = st.number_input("Příčný posun anténa -> běhoun (m) [kladné = vpravo, záporné = vlevo]", value=0.20, step=0.05)
+        # Přednastavené hodnoty podle skutečného stroje
+        offset_m = st.number_input("Podélný posun anténa -> běhoun (m)", value=2.65, step=0.05)
+        offset_transverse_m = st.number_input("Příčný posun anténa -> běhoun (m) [kladné = vpravo, záporné = vlevo]", value=0.26, step=0.01)
         min_speed_kmh = st.slider("Minimální rychlost (km/h)", 0.0, 5.0, 1.0, 0.5)
         
         st.header("4. Nastavení Limitů a Mřížky")
         target_min = st.number_input("Cílové minimum (Kb):", value=20.0, step=1.0)
         target_max = st.number_input("Cílové maximum (Kb):", value=45.0, step=1.0)
-        grid_size_m = st.slider("Velikost mřížky (m)", 0.5, 3.0, 1.0, 0.5)
+        grid_size_m = st.slider("Logická mřížka (m)", 0.5, 3.0, 1.0, 0.5)
         
         st.header("5. Vizuál")
         colormap = st.selectbox("Paleta Heatmapy", ['Turbo', 'Viridis', 'Plasma', 'Inferno', 'Jet'], index=0)
@@ -141,7 +142,6 @@ if uploaded_file is not None:
     df_valid = zpracuj_geodata(df_raw, col_lat, col_lon, col_stiff, col_vib, col_time, col_speed, col_dir, offset_m, offset_transverse_m, min_speed_kmh)
     
     if not df_valid.empty:
-        # BEZPEČNOSTNÍ POJISTKA 1: Převedení max_pass tak, aby slider nikdy nespadl
         max_pass_val = df_valid['pass_id'].max(skipna=True)
         max_pass = int(max_pass_val) if pd.notna(max_pass_val) else 1
         slider_max = max_pass if max_pass > 1 else 2
@@ -154,6 +154,7 @@ if uploaded_file is not None:
         
         df_current = df_valid[df_valid['pass_id'] <= selected_pass].copy()
         
+        # Logická mřížka (slouží jen pro spojení bodů nad sebou, nevykresluje se)
         lat_step = grid_size_m / 111320
         lon_step = grid_size_m / (111320 * np.cos(np.radians(avg_lat)))
         df_current['lat_bin'] = (df_current['corr_lat'] // lat_step) * lat_step + (lat_step / 2)
@@ -162,17 +163,33 @@ if uploaded_file is not None:
         # Ochrana pro heatmapy (jen platné vibrační hodnoty)
         df_vib = df_current[(df_current['is_vibrating'] == True) & (df_current[col_stiff].notna())].copy()
         
-        # Analýza žehlení chronologicky
+        # --- NOVÁ LOGIKA ŽEHLENÍ ---
         df_current_sorted = df_current.sort_values('parsed_time')
-        df_ironing = df_current_sorted.groupby(['lat_bin', 'lon_bin']).agg(
-            First_Is_Vibrating=('is_vibrating', 'first'),
-            Last_Is_Vibrating=('is_vibrating', 'last'),
-            Total_Passes=('pass_id', 'nunique')
-        ).reset_index()
         
-        # BEZPEČNOSTNÍ POJISTKA 2: Místo vlnovky (~) používáme stabilní "== False"
-        df_ironing['Is_Initial_Ironed'] = df_ironing['First_Is_Vibrating'] == False
-        df_ironing['Is_Final_Ironed'] = df_ironing['Last_Is_Vibrating'] == False
+        def analyze_ironing(group):
+            pass_vib = group.groupby('pass_id')['is_vibrating'].max()
+            is_vib_array = pass_vib.values
+            total_passes = len(is_vib_array)
+            
+            # Pokud všechno bylo jen statické
+            if not is_vib_array.any(): 
+                return pd.Series({'Initial_Static': total_passes, 'Final_Static': total_passes, 'Total_Passes': total_passes, 'Real_Lon': group['corr_lon'].iloc[-1], 'Real_Lat': group['corr_lat'].iloc[-1]})
+            
+            first_vib = is_vib_array.argmax()
+            last_vib = len(is_vib_array) - 1 - is_vib_array[::-1].argmax()
+            
+            return pd.Series({
+                'Initial_Static': first_vib,
+                'Final_Static': len(is_vib_array) - 1 - last_vib,
+                'Total_Passes': total_passes,
+                'Real_Lon': group['corr_lon'].iloc[-1], 
+                'Real_Lat': group['corr_lat'].iloc[-1]
+            })
+
+        df_ironing = df_current_sorted.groupby(['lat_bin', 'lon_bin']).apply(analyze_ironing).reset_index()
+        
+        df_ironing['Is_Initial_Ironed'] = df_ironing['Initial_Static'] > 0
+        df_ironing['Is_Final_Ironed'] = df_ironing['Final_Static'] > 0
 
         tab1, tab2, tab3, tab4, tab5 = st.tabs([
             "🕹️ 1. Simulace (Vibrace)", 
@@ -204,19 +221,21 @@ if uploaded_file is not None:
             fig_final = go.Figure()
             if not df_vib.empty:
                 df_vib_sorted = df_vib.sort_values('parsed_time')
-                df_final = df_vib_sorted.groupby(['lat_bin', 'lon_bin']).agg(
-                    Last_Kb=(col_stiff, 'last'),
-                    Vib_Pass_Count=('pass_id', 'nunique')
-                ).reset_index()
+                
+                # ZMĚNA: Bereme skutečnou souřadnici posledního pojezdu
+                df_final = df_vib_sorted.groupby(['lat_bin', 'lon_bin']).tail(1).copy()
+                
+                pass_counts = df_vib_sorted.groupby(['lat_bin', 'lon_bin'])['pass_id'].nunique().reset_index(name='Vib_Pass_Count')
+                df_final = df_final.merge(pass_counts, on=['lat_bin', 'lon_bin'])
                 
                 fig_final.add_trace(go.Scatter(
-                    x=df_final['lon_bin'], y=df_final['lat_bin'], mode='markers',
+                    x=df_final['corr_lon'], y=df_final['corr_lat'], mode='markers',
                     marker=dict(
-                        symbol='square', size=15, opacity=0.9,
-                        color=df_final['Last_Kb'], colorscale=colormap,
+                        symbol='square', size=12, opacity=0.9,
+                        color=df_final[col_stiff], colorscale=colormap,
                         showscale=True, colorbar=dict(title="Finální Kb [-]")
                     ),
-                    hovertext="Finální Kb: " + df_final['Last_Kb'].round(1).astype(str) + " (Vib. průjezdů: " + df_final['Vib_Pass_Count'].astype(str) + ")"
+                    hovertext="Finální Kb: " + df_final[col_stiff].round(1).astype(str) + " (Vib. průjezdů: " + df_final['Vib_Pass_Count'].astype(str) + ")"
                 ))
             fig_final.update_layout(
                 xaxis=dict(tickformat=".7f", hoverformat=".7f"),
@@ -294,12 +313,12 @@ if uploaded_file is not None:
             
             if "Finální" in ironing_mode:
                 df_ironing['Selected_Status'] = df_ironing['Is_Final_Ironed']
-                label_true = "Finálně přežehleno (Zavřeno)"
+                label_true = "Finálně přežehleno"
                 label_false = "Nepřežehleno na závěr (Povrch zůstal otevřený)"
                 metric_title = "Plocha úspěšně finálně uzavřena staticky"
             else:
                 df_ironing['Selected_Status'] = df_ironing['Is_Initial_Ironed']
-                label_true = "Úvodně přežehleno (Stabilizováno staticky)"
+                label_true = "Úvodně přežehleno"
                 label_false = "Započato rovnou s vibrací (Riziko zaboření/střihu)"
                 metric_title = "Plocha úvodně ošetřena před spuštěním vibrace"
 
@@ -309,12 +328,15 @@ if uploaded_file is not None:
                 colors_iron = np.where(df_ironing['Selected_Status'], '#22c55e', '#ef4444')
                 labels_iron = np.where(df_ironing['Selected_Status'], label_true, label_false)
                 
-                # BEZPEČNOSTNÍ POJISTKA 3: Bezpečné vytváření popisků (zabrání Numpy/Pandas kolizi)
-                hover_text = [f"{lbl} | Celkem pojezdů v buňce: {pas}" for lbl, pas in zip(labels_iron, df_ironing['Total_Passes'])]
+                # Zobrazení detailních informací o statických i celkových pojezdech
+                hover_text = [
+                    f"{lbl}<br>Úvodní statika (pojezdů): {int(init)}<br>Finální statika (pojezdů): {int(fin)}<br>Celkem pojezdů stroje: {int(tot)}" 
+                    for lbl, init, fin, tot in zip(labels_iron, df_ironing['Initial_Static'], df_ironing['Final_Static'], df_ironing['Total_Passes'])
+                ]
                 
                 fig_iron.add_trace(go.Scatter(
-                    x=df_ironing['lon_bin'], y=df_ironing['lat_bin'], mode='markers',
-                    marker=dict(symbol='square', size=15, opacity=0.9, color=colors_iron),
+                    x=df_ironing['Real_Lon'], y=df_ironing['Real_Lat'], mode='markers',
+                    marker=dict(symbol='square', size=12, opacity=0.9, color=colors_iron),
                     hovertext=hover_text
                 ))
             
