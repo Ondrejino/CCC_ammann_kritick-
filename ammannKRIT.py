@@ -1,4 +1,4 @@
-import streamlit as st
+code_content = """import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
@@ -6,9 +6,9 @@ from pyproj import Geod
 import io
 
 # --- 1. NASTAVENÍ APLIKACE ---
-st.set_page_config(page_title="CCC Ultimátní Detektor", layout="wide")
+st.set_page_config(page_title="CCC Ultimátní Detektor v2", layout="wide")
 st.title("CCC Detektor: Komplexní analýza zhutnění")
-st.caption("Interaktivní přehrávání stavby vrstvu po vrstvě.")
+st.caption("Interaktivní přehrávání stavby vrstvu po vrstvě se sledováním úvodního i finálního statického žehlení.")
 
 # --- 2. POMOCNÉ FUNKCE ---
 @st.cache_data(show_spinner="Načítám a parsuji data...")
@@ -35,14 +35,16 @@ def najdi_vychozi_sloupec(columns, klicova_slova):
                 return col
     return columns[0] if len(columns) > 0 else None
 
-# --- NOVÉ: CACHOVANÉ GEOPROSTOROVÉ ZPRACOVÁNÍ ---
+# --- OPRAVENO: CACHOVANÉ GEOPROSTOROVÉ ZPRACOVÁNÍ (Ponechává statická data bez Kb) ---
 @st.cache_data(show_spinner="Zpracovávám geodata, azimuty a pojezdy (počítá se jen jednou)...")
 def zpracuj_geodata(df_raw, col_lat, col_lon, col_stiff, col_vib, col_time, col_speed, col_dir, offset_m, offset_transverse_m, min_speed_kmh):
     df = df_raw.copy()
     
     # Převody
-    for col in [col_lat, col_lon, col_stiff, col_vib]:
+    for col in [col_lat, col_lon, col_vib]:
         df[col] = pd.to_numeric(df[col].astype(str).str.replace(',', '.'), errors='coerce')
+    
+    df[col_stiff] = pd.to_numeric(df[col_stiff].astype(str).str.replace(',', '.'), errors='coerce')
     df['parsed_time'] = pd.to_datetime(df[col_time].astype(str).str.split(' GMT').str[0], errors='coerce')
     
     # Detekce vibrace vs. statiky
@@ -53,7 +55,8 @@ def zpracuj_geodata(df_raw, col_lat, col_lon, col_stiff, col_vib, col_time, col_
     else:
         df['speed_kmh'] = 0.0
 
-    df = df.dropna(subset=[col_lat, col_lon, col_stiff, 'parsed_time']).sort_values('parsed_time').reset_index(drop=True)
+    # OPRAVA: Odstraněn col_stiff z dropna, abychom neztratili statické pojezdy bez hodnoty tuhosti
+    df = df.dropna(subset=[col_lat, col_lon, 'parsed_time']).sort_values('parsed_time').reset_index(drop=True)
     
     if len(df) <= 5:
         return pd.DataFrame()
@@ -75,15 +78,11 @@ def zpracuj_geodata(df_raw, col_lat, col_lon, col_stiff, col_vib, col_time, col_
     machine_heading = np.where(is_forward, fwd_az, (fwd_az + 180) % 360)
     
     # --- MATEMATIKA L-tvaru (Korekce Anténa -> Běhoun) ---
-    # Krok 1: Podélný posun (vpřed/vzad)
     temp_lons, temp_lats, _ = geod.fwd(df[col_lon].values, df[col_lat].values, machine_heading, np.full(len(df), offset_m))
-    
-    # Krok 2: Příčný posun (kolmo na směr jízdy). +90 stupňů = doprava
     transverse_heading = (machine_heading + 90) % 360
     new_lons, new_lats, _ = geod.fwd(temp_lons, temp_lats, transverse_heading, np.full(len(df), offset_transverse_m))
     
     df['corr_lon'], df['corr_lat'] = new_lons, new_lats
-    # ----------------------------------------------------
     
     # Rychlost (Záložní)
     if col_speed == "Vypočítat z GPS (Záložní)":
@@ -141,7 +140,6 @@ with st.sidebar:
 # --- 4. HLAVNÍ VÝPOČETNÍ LOGIKA ---
 if uploaded_file is not None:
     
-    # ⚡ Využití cachované funkce pro masivní zrychlení (nyní včetně příčného posunu)
     df_valid = zpracuj_geodata(df_raw, col_lat, col_lon, col_stiff, col_vib, col_time, col_speed, col_dir, offset_m, offset_transverse_m, min_speed_kmh)
     
     if not df_valid.empty:
@@ -159,14 +157,19 @@ if uploaded_file is not None:
         df_current['lat_bin'] = (df_current['corr_lat'] // lat_step) * lat_step + (lat_step / 2)
         df_current['lon_bin'] = (df_current['corr_lon'] // lon_step) * lon_step + (lon_step / 2)
         
-        df_vib = df_current[df_current['is_vibrating'] == True].copy()
+        # OPRAVA: Pro mapy tuhosti bereme jen validní vibrační data s nenulovým Kb
+        df_vib = df_current[(df_current['is_vibrating'] == True) & (df_current[col_stiff].notna())].copy()
         
+        # NOVÉ / UPRAVENÉ: Analýza žehlení (úvodní i finální chronologicky na buňku)
         df_current_sorted = df_current.sort_values('parsed_time')
         df_ironing = df_current_sorted.groupby(['lat_bin', 'lon_bin']).agg(
+            First_Is_Vibrating=('is_vibrating', 'first'),
             Last_Is_Vibrating=('is_vibrating', 'last'),
             Total_Passes=('pass_id', 'nunique')
         ).reset_index()
-        df_ironing['Is_Ironed'] = ~df_ironing['Last_Is_Vibrating']
+        
+        df_ironing['Is_Initial_Ironed'] = ~df_ironing['First_Is_Vibrating']
+        df_ironing['Is_Final_Ironed'] = ~df_ironing['Last_Is_Vibrating']
 
         tab1, tab2, tab3, tab4, tab5 = st.tabs([
             "🕹️ 1. Simulace (Vibrace)", 
@@ -180,12 +183,12 @@ if uploaded_file is not None:
             st.subheader(f"Vývoj tuhosti (Pojezd 1 až {selected_pass}) - Vibrační běhy")
             st.caption("Čistá data reprezentující aktuální stav podkladu. Body jsou již prostorově korigovány o podélný i příčný offset.")
             fig_raw = go.Figure()
-            fig_raw.add_trace(go.Scatter(
-                x=df_vib['corr_lon'], y=df_vib['corr_lat'], mode='markers',
-                marker=dict(size=6, color=df_vib[col_stiff], colorscale=colormap, showscale=True, opacity=0.7, colorbar=dict(title="Kb [-]")),
-                hovertext="Pojezd: " + df_vib['pass_id'].astype(str) + " | Kb: " + df_vib[col_stiff].round(1).astype(str)
-            ))
-            # PŘIDÁNO: tickformat a hoverformat pro x i y
+            if not df_vib.empty:
+                fig_raw.add_trace(go.Scatter(
+                    x=df_vib['corr_lon'], y=df_vib['corr_lat'], mode='markers',
+                    marker=dict(size=6, color=df_vib[col_stiff], colorscale=colormap, showscale=True, opacity=0.7, colorbar=dict(title="Kb [-]")),
+                    hovertext="Pojezd: " + df_vib['pass_id'].astype(str) + " | Kb: " + df_vib[col_stiff].round(1).astype(str)
+                ))
             fig_raw.update_layout(
                 xaxis=dict(tickformat=".7f", hoverformat=".7f"),
                 yaxis=dict(scaleanchor="x", scaleratio=cos_correction, tickformat=".7f", hoverformat=".7f"), 
@@ -195,23 +198,23 @@ if uploaded_file is not None:
 
         with tab2:
             st.subheader(f"Mapa finální kvality (Poslední platné Kb)")
-            df_vib_sorted = df_vib.sort_values('parsed_time')
-            df_final = df_vib_sorted.groupby(['lat_bin', 'lon_bin']).agg(
-                Last_Kb=(col_stiff, 'last'),
-                Vib_Pass_Count=('pass_id', 'nunique')
-            ).reset_index()
-            
             fig_final = go.Figure()
-            fig_final.add_trace(go.Scatter(
-                x=df_final['lon_bin'], y=df_final['lat_bin'], mode='markers',
-                marker=dict(
-                    symbol='square', size=15, opacity=0.9,
-                    color=df_final['Last_Kb'], colorscale=colormap,
-                    showscale=True, colorbar=dict(title="Finální Kb [-]")
-                ),
-                hovertext="Finální Kb: " + df_final['Last_Kb'].round(1).astype(str) + " (Vib. průjezdů: " + df_final['Vib_Pass_Count'].astype(str) + ")"
-            ))
-            # PŘIDÁNO: tickformat a hoverformat pro x i y
+            if not df_vib.empty:
+                df_vib_sorted = df_vib.sort_values('parsed_time')
+                df_final = df_vib_sorted.groupby(['lat_bin', 'lon_bin']).agg(
+                    Last_Kb=(col_stiff, 'last'),
+                    Vib_Pass_Count=('pass_id', 'nunique')
+                ).reset_index()
+                
+                fig_final.add_trace(go.Scatter(
+                    x=df_final['lon_bin'], y=df_final['lat_bin'], mode='markers',
+                    marker=dict(
+                        symbol='square', size=15, opacity=0.9,
+                        color=df_final['Last_Kb'], colorscale=colormap,
+                        showscale=True, colorbar=dict(title="Finální Kb [-]")
+                    ),
+                    hovertext="Finální Kb: " + df_final['Last_Kb'].round(1).astype(str) + " (Vib. průjezdů: " + df_final['Vib_Pass_Count'].astype(str) + ")"
+                ))
             fig_final.update_layout(
                 xaxis=dict(tickformat=".7f", hoverformat=".7f"),
                 yaxis=dict(scaleanchor="x", scaleratio=cos_correction, tickformat=".7f", hoverformat=".7f"), 
@@ -223,29 +226,29 @@ if uploaded_file is not None:
             st.subheader(f"Mapa Anomálií (Po pojezdu {selected_pass})")
             fig_anom = go.Figure()
             
-            df_ok_bg = df_vib[(df_vib[col_stiff] >= target_min) & (df_vib[col_stiff] <= target_max)]
-            fig_anom.add_trace(go.Scatter(
-                x=df_ok_bg['corr_lon'], y=df_ok_bg['corr_lat'], mode='markers',
-                marker=dict(size=4, color='#E5E7EB', opacity=0.3), name="V cílovém pásmu (OK)", hoverinfo='none'
-            ))
-            
-            df_under = df_vib[df_vib[col_stiff] < target_min]
-            if not df_under.empty:
+            if not df_vib.empty:
+                df_ok_bg = df_vib[(df_vib[col_stiff] >= target_min) & (df_vib[col_stiff] <= target_max)]
                 fig_anom.add_trace(go.Scatter(
-                    x=df_under['corr_lon'], y=df_under['corr_lat'], mode='markers',
-                    marker=dict(size=6, color='red'), name=f"Nedohutněno (< {target_min})",
-                    hovertext="Kb: " + df_under[col_stiff].round(1).astype(str)
+                    x=df_ok_bg['corr_lon'], y=df_ok_bg['corr_lat'], mode='markers',
+                    marker=dict(size=4, color='#E5E7EB', opacity=0.3), name="V cílovém pásmu (OK)", hoverinfo='none'
                 ))
+                
+                df_under = df_vib[df_vib[col_stiff] < target_min]
+                if not df_under.empty:
+                    fig_anom.add_trace(go.Scatter(
+                        x=df_under['corr_lon'], y=df_under['corr_lat'], mode='markers',
+                        marker=dict(size=6, color='red'), name=f"Nedohutněno (< {target_min})",
+                        hovertext="Kb: " + df_under[col_stiff].round(1).astype(str)
+                    ))
+                
+                df_over = df_vib[df_vib[col_stiff] > target_max]
+                if not df_over.empty:
+                    fig_anom.add_trace(go.Scatter(
+                        x=df_over['corr_lon'], y=df_over['corr_lat'], mode='markers',
+                        marker=dict(size=6, color='blue'), name=f"Tvrdá anomálie (> {target_max})",
+                        hovertext="Kb: " + df_over[col_stiff].round(1).astype(str)
+                    ))
             
-            df_over = df_vib[df_vib[col_stiff] > target_max]
-            if not df_over.empty:
-                fig_anom.add_trace(go.Scatter(
-                    x=df_over['corr_lon'], y=df_over['corr_lat'], mode='markers',
-                    marker=dict(size=6, color='blue'), name=f"Tvrdá anomálie (> {target_max})",
-                    hovertext="Kb: " + df_over[col_stiff].round(1).astype(str)
-                ))
-            
-            # PŘIDÁNO: tickformat a hoverformat pro x i y
             fig_anom.update_layout(
                 xaxis=dict(tickformat=".7f", hoverformat=".7f"),
                 yaxis=dict(scaleanchor="x", scaleratio=cos_correction, tickformat=".7f", hoverformat=".7f"), 
@@ -256,13 +259,13 @@ if uploaded_file is not None:
         with tab4:
             st.subheader(f"Statistický vývoj (Do pojezdu {selected_pass})")
             fig_hist = go.Figure()
-            fig_hist.add_trace(go.Histogram(x=df_vib[col_stiff], nbinsx=50, marker_color='gray', name='Počet bodů (Vib.)'))
-            fig_hist.add_vrect(x0=target_min, x1=target_max, fillcolor="green", opacity=0.2, layer="below", line_width=0, annotation_text="Cílové pásmo", annotation_position="top left")
-            
-            max_val_99 = df_vib[col_stiff].quantile(0.99)
-            safe_max = max(target_max * 1.2, max_val_99) if not pd.isna(max_val_99) else target_max * 1.5
-            
-            fig_hist.update_layout(xaxis_title="Hodnota Kb [-]", yaxis_title="Počet bodů", xaxis=dict(range=[0, safe_max]), height=500, bargap=0.1)
+            if not df_vib.empty:
+                fig_hist.add_trace(go.Histogram(x=df_vib[col_stiff], nbinsx=50, marker_color='gray', name='Počet bodů (Vib.)'))
+                fig_hist.add_vrect(x0=target_min, x1=target_max, fillcolor="green", opacity=0.2, layer="below", line_width=0, annotation_text="Cílové pásmo", annotation_position="top left")
+                
+                max_val_99 = df_vib[col_stiff].quantile(0.99)
+                safe_max = max(target_max * 1.2, max_val_99) if not pd.isna(max_val_99) else target_max * 1.5
+                fig_hist.update_layout(xaxis_title="Hodnota Kb [-]", yaxis_title="Počet bodů", xaxis=dict(range=[0, safe_max]), height=500, bargap=0.1)
             st.plotly_chart(fig_hist, use_container_width=True)
             
             total_vib = len(df_vib)
@@ -277,19 +280,37 @@ if uploaded_file is not None:
                 c3.metric("🔵 Nad limitem (Příliš tvrdé)", f"{pct_over:.1f} %")
 
         with tab5:
-            st.subheader(f"Uzavření vrstvy proti vodě (Přežehlení)")
-            fig_iron = go.Figure()
+            st.subheader("Analýza statického žehlení vrstvy")
+            st.caption("Při statickém chodu bez vibrací stroje nezaznamenávají hodnotu tuhosti (Kb=NaN), avšak trajektorie pohybu je klíčová.")
             
-            colors_iron = np.where(df_ironing['Is_Ironed'], '#22c55e', '#ef4444')
-            labels_iron = np.where(df_ironing['Is_Ironed'], 'Přežehleno (Zavřeno)', 'Nepřežehleno (Otevřeno)')
+            # Přepínač pro zobrazení úvodního nebo finálního žehlení
+            ironing_mode = st.radio(
+                "Vyberte typ technologické kontroly:",
+                ["Finální přežehlení (Uzavření povrchu proti srážkové vodě)", "Úvodní přežehlení (Stabilizace měkkého podkladu proti zaboření)"],
+                horizontal=True
+            )
+            
+            if "Finální" in ironing_mode:
+                df_ironing['Selected_Status'] = df_ironing['Is_Final_Ironed']
+                label_true = "Finálně přežehleno (Zavřeno)"
+                label_false = "Nepřežehleno na závěr (Povrch zůstal otevřený)"
+                metric_title = "Plocha úspěšně finálně uzavřena staticky"
+            else:
+                df_ironing['Selected_Status'] = df_ironing['Is_Initial_Ironed']
+                label_true = "Úvodně přežehleno (Stabilizováno staticky)"
+                label_false = "Započato rovnou s vibrací (Riziko zaboření/střihu)"
+                metric_title = "Plocha úvodně ošetřena před spuštěním vibrace"
+
+            fig_iron = go.Figure()
+            colors_iron = np.where(df_ironing['Selected_Status'], '#22c55e', '#ef4444')
+            labels_iron = np.where(df_ironing['Selected_Status'], label_true, label_false)
             
             fig_iron.add_trace(go.Scatter(
                 x=df_ironing['lon_bin'], y=df_ironing['lat_bin'], mode='markers',
                 marker=dict(symbol='square', size=15, opacity=0.9, color=colors_iron),
-                hovertext=labels_iron + " | Celkem pojezdů zde: " + df_ironing['Total_Passes'].astype(str)
+                hovertext=labels_iron + " | Celkem pojezdů v buňce: " + df_ironing['Total_Passes'].astype(str)
             ))
             
-            # PŘIDÁNO: tickformat a hoverformat pro x i y
             fig_iron.update_layout(
                 xaxis=dict(tickformat=".7f", hoverformat=".7f"),
                 yaxis=dict(scaleanchor="x", scaleratio=cos_correction, tickformat=".7f", hoverformat=".7f"), 
@@ -298,12 +319,17 @@ if uploaded_file is not None:
             st.plotly_chart(fig_iron, use_container_width=True)
             
             total_area_cells = len(df_ironing)
-            ironed_cells = df_ironing['Is_Ironed'].sum()
+            ironed_cells = df_ironing['Selected_Status'].sum()
             pct_ironed = (ironed_cells / total_area_cells * 100) if total_area_cells > 0 else 0
             
-            st.metric("Plocha úspěšně přežehlena a uzavřena", f"{pct_ironed:.1f} %")
+            st.metric(metric_title, f"{pct_ironed:.1f} %")
 
     else:
         st.error("Po odfiltrování nezbyla žádná data.")
 else:
     st.info("👋 Nahrajte CSV. Následně použijte slider pro přehrávání dat.")
+"""
+
+with open("ccc_detector_v2.py", "w", encoding="utf-8") as f:
+    f.write(code_content)
+print("File compiled successfully.")
