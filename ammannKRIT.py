@@ -8,9 +8,9 @@ import io
 import csv
 
 # --- 1. NASTAVENÍ APLIKACE ---
-st.set_page_config(page_title="CCC Detektor: Vědecká Analýza", layout="wide")
-st.title("🚜 CCC Detektor: Přesná geodetická analýza (Kód 3)")
-st.caption("Fyzikálně a prostorově věrná vizualizace CCC dat s WGS84 projekcí a reálnými polygony.")
+st.set_page_config(page_title="CCC Detektor: Exaktní WGS84", layout="wide")
+st.title("🚜 CCC Detektor: Geodetická a fyzikální analýza (Kód 4)")
+st.caption("Fyzikálně věrná vizualizace CCC dat ve WGS84 projekci s dynamickými polygony a přesností 1 cm.")
 
 # --- 2. DATA PARSER (Odolný vůči reálným strojům) ---
 @st.cache_data(show_spinner="Analyzuji hlavičky a načítám surová data...")
@@ -43,22 +43,24 @@ def najdi_vychozi_sloupec(columns, klicova_slova):
                 return col
     return columns[0] if len(columns) > 0 else None
 
-# --- 3. GEODETICKÉ JÁDRO A VEKTORIZACE (WGS84, Fyzika) ---
-def vytvor_geometrii_pasu(df_geom, width_m, length_m):
-    """Vektorizovaný výpočet rohů válce na elipsoidu WGS84 pomocí pyproj."""
+# --- 3. GEODETICKÉ JÁDRO (WGS84, Dynamická Fyzika) ---
+def vytvor_geometrii_pasu(df_geom, width_m):
+    """Vektorizovaný výpočet rohů válce na elipsoidu WGS84 s dynamickou délkou kroků."""
     geod = Geod(ellps="WGS84")
     
     lon = df_geom['drum_lon'].values
     lat = df_geom['drum_lat'].values
     heading = df_geom['heading'].values
+    # Délka polygonu je nyní dynamická (podle toho, kolik stroj ujel)
+    length_array = df_geom['step_dist'].values
     
-    # Krok 1: Posun vpřed/vzad pro určení osy běhounu (podélně)
+    # Krok 1: Posun vpřed/vzad pro určení osy běhounu
     fwd_az = heading
     bck_az = (heading + 180) % 360
-    fwd_lon, fwd_lat, _ = geod.fwd(lon, lat, fwd_az, np.full(len(lon), length_m / 2))
-    bck_lon, bck_lat, _ = geod.fwd(lon, lat, bck_az, np.full(len(lon), length_m / 2))
+    fwd_lon, fwd_lat, _ = geod.fwd(lon, lat, fwd_az, length_array / 2)
+    bck_lon, bck_lat, _ = geod.fwd(lon, lat, bck_az, length_array / 2)
     
-    # Krok 2: Posun vlevo/vpravo pro získání 4 rohů (kolmo na směr jízdy)
+    # Krok 2: Posun vlevo/vpravo pro získání 4 rohů (šířka válce)
     right_az = (heading + 90) % 360
     left_az = (heading - 90) % 360
     
@@ -69,8 +71,8 @@ def vytvor_geometrii_pasu(df_geom, width_m, length_m):
     
     return c1_lon, c1_lat, c2_lon, c2_lat, c3_lon, c3_lat, c4_lon, c4_lat
 
-@st.cache_data(show_spinner="Počítám exaktní WGS84 kinematiku a polygony...")
-def zpracuj_geodata(df_raw, col_lat, col_lon, col_stiff, col_vib, col_time, col_speed, col_dir, offset_fwd, min_speed_kmh):
+@st.cache_data(show_spinner="Počítám exaktní 2D kinematiku, offsety a polygony...")
+def zpracuj_geodata(df_raw, col_lat, col_lon, col_stiff, col_vib, col_time, col_speed, col_dir, offset_fwd, offset_right, min_speed_kmh):
     df = df_raw.copy()
     
     for col in [col_lat, col_lon, col_stiff, col_vib]:
@@ -83,12 +85,11 @@ def zpracuj_geodata(df_raw, col_lat, col_lon, col_stiff, col_vib, col_time, col_
 
     geod = Geod(ellps="WGS84")
     
-    # 1. Vyhlazení GPS šumu pro stabilní azimut
+    # 1. Vyhlazení mikrootřesů RTK GPS (Klouzavý průměr na souřadnicích)
     df['smooth_lon'] = df[col_lon].rolling(5, min_periods=1, center=True).mean()
     df['smooth_lat'] = df[col_lat].rolling(5, min_periods=1, center=True).mean()
     
-    # 2. Výpočet reálného azimutu (heading) na elipsoidu
-    # Shift posune hodnoty, abychom porovnávali bod i s bodem i+step
+    # 2. Směrový vektor z vyhlazených dat (Zabraňuje skákání azimutu)
     step = 2
     fwd_az, _, _ = geod.inv(
         df['smooth_lon'].shift(step).bfill().values, df['smooth_lat'].shift(step).bfill().values,
@@ -96,23 +97,27 @@ def zpracuj_geodata(df_raw, col_lat, col_lon, col_stiff, col_vib, col_time, col_
     )
     df['heading'] = fwd_az % 360
     
-    # Krok vzad/vpřed detekce směru (zjednodušená pojistka proti couvání)
-    if col_dir in df.columns:
-        is_reverse = (df[col_dir].astype(str) == "0") | (df[col_dir].astype(str) == "-1")
-        df['heading'] = np.where(is_reverse, (df['heading'] + 180) % 360, df['heading'])
+    # 3. 2D KOREKCE ANTÉNY (Fwd + Right) do osy běhounu
+    # Fáze A: Posun podélný
+    temp_lon, temp_lat, _ = geod.fwd(df[col_lon].values, df[col_lat].values, df['heading'].values, np.full(len(df), offset_fwd))
+    # Fáze B: Posun příčný (kolmo)
+    heading_right = (df['heading'] + 90) % 360
+    df['drum_lon'], df['drum_lat'], _ = geod.fwd(temp_lon, temp_lat, heading_right, np.full(len(df), offset_right))
 
-    # 3. Posun anténa -> střed běhounu
-    df['drum_lon'], df['drum_lat'], _ = geod.fwd(df[col_lon].values, df[col_lat].values, df['heading'].values, np.full(len(df), offset_fwd))
-
-    # 4. Rychlost a filtrace stání
+    # 4. Rychlost a dynamická délka stopy (dist)
+    df['dt'] = df['parsed_time'].diff().dt.total_seconds().replace(0, 0.01).bfill()
+    _, _, dist = geod.inv(df['drum_lon'].shift().bfill().values, df['drum_lat'].shift().bfill().values, df['drum_lon'].values, df['drum_lat'].values)
+    
+    # Fyzikální ošetření: Stopa nesmí být menší než 10 cm a delší než 2 m (ochrana před výpadky GPS pingů)
+    df['step_dist'] = np.clip(dist, 0.1, 2.0)
+    
     if col_speed != "Vypočítat z GPS":
         df['speed_kmh'] = pd.to_numeric(df[col_speed].astype(str).str.replace(',', '.'), errors='coerce')
     else:
-        df['dt'] = df['parsed_time'].diff().dt.total_seconds().replace(0, 0.01).bfill()
-        _, _, dist = geod.inv(df['drum_lon'].shift().bfill().values, df['drum_lat'].shift().bfill().values, df['drum_lon'].values, df['drum_lat'].values)
         df['speed_kmh'] = (dist / df['dt']) * 3.6
         df['speed_kmh'] = df['speed_kmh'].rolling(3, min_periods=1, center=True).mean()
 
+    # Filtrace a přiřazení sekvencí pojezdů
     df['is_vibrating'] = df[col_vib].fillna(0) > 0.1
     df_valid = df[df['speed_kmh'] >= min_speed_kmh].copy()
     
@@ -139,26 +144,23 @@ with st.sidebar:
         col_vib = st.selectbox("Vibrace (Amp/Freq)", df_raw.columns, index=df_raw.columns.get_loc(najdi_vychozi_sloupec(df_raw.columns, ['amp', 'freq', 'vib'])))
         col_speed = st.selectbox("Rychlost", ["Vypočítat z GPS"] + list(df_raw.columns), index=0)
 
-        st.header("📐 3. Stroj a geometrie")
-        offset_fwd = st.number_input("Posun anténa -> běhoun podélně (m)", value=2.0, step=0.1)
+        st.header("📐 3. Stroj a offsety")
+        offset_fwd = st.number_input("Posun antény podélně (m)", value=2.0, step=0.1)
+        offset_right = st.number_input("Posun antény příčně vpravo (m)", value=0.0, step=0.1, help="Kladné = doprava od středu, Záporné = doleva")
         roller_width = st.number_input("Šířka válce / běhounu (m)", value=2.13, step=0.01)
-        segment_len = st.number_input("Délka vykreslovaného segmentu (m)", value=1.0, step=0.1)
         min_speed_kmh = st.number_input("Filtr stání (km/h)", value=0.5, step=0.1)
 
-        st.header("🎯 4. Cíle")
+        st.header("🎯 4. Cílové meze")
         target_min = st.number_input("Minimální Kb:", value=25.0, step=1.0)
         target_max = st.number_input("Maximální Kb (Přezhutnění):", value=50.0, step=1.0)
         colormap = st.selectbox("Paleta", ['Turbo', 'Viridis', 'Jet'], index=0)
 
 # --- 5. HLAVNÍ LOGIKA A VYKRESLOVÁNÍ ---
-def generuj_optimalizovany_polygon_trace(df_subset, width, length, color_val, hover_text, color_scale, zmin, zmax, name):
-    """Zásadní zrychlení: Vektorově sestaví cesty pro stovky polygonů do jednoho grafického objektu."""
+def generuj_optimalizovany_polygon_trace(df_subset, width, color_val, color_scale, zmin, zmax, name):
     if df_subset.empty: return None
     
-    # Získání WGS84 rohů (4 x Lon, 4 x Lat arrays)
-    c1x, c1y, c2x, c2y, c3x, c3y, c4x, c4y = vytvor_geometrii_pasu(df_subset, width, length)
+    c1x, c1y, c2x, c2y, c3x, c3y, c4x, c4y = vytvor_geometrii_pasu(df_subset, width)
     
-    # Vektorizované vložení np.nan pro přerušení čar (Místo dřívějšího python FOR cyklu .extend())
     x_vals = np.empty((len(c1x), 6))
     x_vals[:, 0], x_vals[:, 1], x_vals[:, 2], x_vals[:, 3], x_vals[:, 4] = c1x, c2x, c3x, c4x, c1x
     x_vals[:, 5] = np.nan
@@ -169,12 +171,10 @@ def generuj_optimalizovany_polygon_trace(df_subset, width, length, color_val, ho
     y_vals[:, 5] = np.nan
     y_flat = y_vals.flatten()
     
-    # Určení barvy středu binu (jen pro plné barvy anomálií, pro plynulou paletu řešeno jinde)
     if isinstance(color_val, str):
         fill_color = color_val
     else:
-        norm = (color_val - zmin) / (zmax - zmin)
-        norm = np.clip(norm, 0, 1)
+        norm = np.clip((color_val - zmin) / (zmax - zmin), 0, 1)
         fill_color = sample_colorscale(color_scale, [norm])[0]
 
     return go.Scatter(
@@ -184,7 +184,7 @@ def generuj_optimalizovany_polygon_trace(df_subset, width, length, color_val, ho
     )
 
 if uploaded_file is not None:
-    df_valid = zpracuj_geodata(df_raw, col_lat, col_lon, col_stiff, col_vib, col_time, col_speed, col_dir, offset_fwd, min_speed_kmh)
+    df_valid = zpracuj_geodata(df_raw, col_lat, col_lon, col_stiff, col_vib, col_time, col_speed, col_dir, offset_fwd, offset_right, min_speed_kmh)
     
     if not df_valid.empty:
         max_pass = int(df_valid['pass_id'].max())
@@ -193,120 +193,133 @@ if uploaded_file is not None:
         df_current = df_valid[df_valid['pass_id'] <= selected_pass].copy()
         df_vib = df_current[df_current['is_vibrating'] == True].copy()
         
-        # Kosinusová korekce pro proporční zobrazení map v ČR (aby nebyla mapa zploštělá)
         avg_lat = df_current['drum_lat'].mean()
         cos_corr = 1 / np.cos(np.radians(avg_lat))
+        # Striktní formát na 7 desetinných míst pro mapu
         map_layout = dict(scaleanchor="x", scaleratio=cos_corr, tickformat=".7f", hoverformat=".7f")
 
         tab1, tab2, tab3, tab4, tab5 = st.tabs([
-            "🗺️ 1. Bodová dráha", "🟦 2. Plocha překryvů", "🔴 3. Anomálie", "📊 4. Histogram", "🧊 5. Žehlení (Hist.)"
+            "🗺️ 1. Bodová dráha", "🟦 2. Plocha překryvů", "🔴 3. Anomálie", "📊 4. Histogram", "🧊 5. Kontrola žehlení"
         ])
 
         with tab1:
-            st.subheader("Přesná WGS84 dráha běhounu")
+            st.subheader("Přesná WGS84 dráha (Střed běhounu)")
             fig1 = go.Figure()
             if not df_vib.empty:
                 fig1.add_trace(go.Scattergl(
                     x=df_vib['drum_lon'], y=df_vib['drum_lat'], mode='markers',
                     marker=dict(size=4, color=df_vib[col_stiff], colorscale=colormap, showscale=True),
-                    hovertext="Kb: " + df_vib[col_stiff].round(1).astype(str)
+                    hovertext="Kb: " + df_vib[col_stiff].round(1).astype(str) + " | Lat: " + df_vib['drum_lat'].round(7).astype(str) + " | Lon: " + df_vib['drum_lon'].round(7).astype(str)
                 ))
             fig1.update_layout(yaxis=map_layout, height=700, margin=dict(l=0,r=0,t=0,b=0))
             st.plotly_chart(fig1, use_container_width=True)
 
         with tab2:
             st.subheader("Plošná mapa (Polygony s překryvy)")
-            st.caption("Fyzikální modely obdélníků stroje ve WGS84. Vykresleno vektorově pro výkon.")
             fig2 = go.Figure()
             if not df_vib.empty:
-                # Roztřídění do 15 barevných košů radikálně snižuje počet DOM elementů, ale zachovává přesnou geometrii
                 bins = 15
                 zmin, zmax = df_vib[col_stiff].min(), df_vib[col_stiff].max()
                 if zmin == zmax: zmax += 0.1
                 df_vib['color_bin'] = np.clip(np.floor((df_vib[col_stiff] - zmin) / (zmax - zmin) * bins), 0, bins - 1)
                 
-                # Vykreslení od nejstarších po nejnovější pojezdy (aby nové překryly staré)
                 df_sorted = df_vib.sort_values('parsed_time')
                 
                 for b in range(bins):
                     df_bin = df_sorted[df_sorted['color_bin'] == b]
                     if df_bin.empty: continue
                     val_center = zmin + (b + 0.5) * ((zmax - zmin) / bins)
-                    trace = generuj_optimalizovany_polygon_trace(df_bin, roller_width, segment_len, val_center, "", colormap, zmin, zmax, f"Kb {val_center:.0f}")
+                    trace = generuj_optimalizovany_polygon_trace(df_bin, roller_width, val_center, colormap, zmin, zmax, f"Kb {val_center:.0f}")
                     if trace: fig2.add_trace(trace)
                 
-                # Dodatečná vrstva teček pro přesný hover (odečet souřadnic a hodnoty)
+                # Exaktní odečet v mapě na 7 desetinných míst
                 fig2.add_trace(go.Scattergl(
                     x=df_sorted['drum_lon'], y=df_sorted['drum_lat'], mode='markers',
-                    marker=dict(color='black', size=1, opacity=0.1),
-                    hovertext="Lat: " + df_sorted['drum_lat'].round(6).astype(str) + " | Kb: " + df_sorted[col_stiff].round(1).astype(str)
+                    marker=dict(color='black', size=2, opacity=0.1),
+                    hovertext="Kb: " + df_sorted[col_stiff].round(1).astype(str) + "<br>Lat: " + df_sorted['drum_lat'].round(7).astype(str) + "<br>Lon: " + df_sorted['drum_lon'].round(7).astype(str)
                 ))
 
             fig2.update_layout(yaxis=map_layout, height=700, margin=dict(l=0,r=0,t=0,b=0), showlegend=False)
             st.plotly_chart(fig2, use_container_width=True)
 
         with tab3:
-            st.subheader("Extrémy a nedohutnění (Reálné polygony)")
+            st.subheader("Interaktivní extrémy (Přezhutněno / Podhutněno)")
             fig3 = go.Figure()
             if not df_vib.empty:
                 df_under = df_vib[df_vib[col_stiff] < target_min]
                 df_over = df_vib[df_vib[col_stiff] > target_max]
                 df_ok = df_vib[(df_vib[col_stiff] >= target_min) & (df_vib[col_stiff] <= target_max)]
                 
-                t_ok = generuj_optimalizovany_polygon_trace(df_ok, roller_width, segment_len, '#E5E7EB', "OK", colormap, 0, 1, "V normě")
-                t_under = generuj_optimalizovany_polygon_trace(df_under, roller_width, segment_len, 'rgba(239, 68, 68, 0.8)', "Pod limit", colormap, 0, 1, "Nedohutněno")
-                t_over = generuj_optimalizovany_polygon_trace(df_over, roller_width, segment_len, 'rgba(59, 130, 246, 0.8)', "Přezhutněno", colormap, 0, 1, "Tvrdé")
+                t_ok = generuj_optimalizovany_polygon_trace(df_ok, roller_width, '#E5E7EB', colormap, 0, 1, "V normě")
+                t_under = generuj_optimalizovany_polygon_trace(df_under, roller_width, 'rgba(239, 68, 68, 0.8)', colormap, 0, 1, "Nedohutněno")
+                t_over = generuj_optimalizovany_polygon_trace(df_over, roller_width, 'rgba(59, 130, 246, 0.8)', colormap, 0, 1, "Přezhutněno")
                 
                 for t in [t_ok, t_under, t_over]:
                     if t: fig3.add_trace(t)
+
+                # Doplnění interaktivní hover vrstvy (aby šly body nalézt v terénu)
+                fig3.add_trace(go.Scattergl(
+                    x=df_vib['drum_lon'], y=df_vib['drum_lat'], mode='markers',
+                    marker=dict(color='black', size=2, opacity=0.05),
+                    hovertext="Kb: " + df_vib[col_stiff].round(1).astype(str) + "<br>Lat: " + df_vib['drum_lat'].round(7).astype(str) + "<br>Lon: " + df_vib['drum_lon'].round(7).astype(str)
+                ))
 
             fig3.update_layout(yaxis=map_layout, height=700, margin=dict(l=0,r=0,t=0,b=0))
             st.plotly_chart(fig3, use_container_width=True)
 
         with tab4:
-            st.subheader("Statistika naměřených Kb z vibračních pojezdů")
+            st.subheader("Statistika naměřených Kb (pouze vibrační data)")
             if not df_vib.empty:
                 fig4 = go.Figure(go.Histogram(x=df_vib[col_stiff], nbinsx=60, marker_color='slategray'))
                 fig4.add_vrect(x0=target_min, x1=target_max, fillcolor="green", opacity=0.2)
                 st.plotly_chart(fig4, use_container_width=True)
 
         with tab5:
-            st.subheader("Analýza historie: Vibrace -> Následné žehlení")
-            st.caption("Algoritmus kontroluje každý bod plochy: Proběhl zde někdy vibrační pojezd? A projel tímto bodem válec staticky ČASOVĚ POZDĚJI?")
-            
+            st.subheader("Finální kontrola povrchu: Uzavření po vibraci")
+            st.caption("Fyzikální mřížka zjišťuje, zda na daném 0.5m úseku proběhla nejprve vibrace a následně jako absolutně poslední krok statické žehlení.")
             fig5 = go.Figure()
             if not df_current.empty:
-                # 1. Časoprostorové indexování: Zaokrouhlíme WGS84 na ~0.5m grid pouze pro účely spárování historie místa
                 df_hist = df_current.copy()
-                df_hist['spatial_index'] = df_hist['drum_lat'].round(5).astype(str) + "_" + df_hist['drum_lon'].round(5).astype(str)
                 
-                # 2. Zjistíme čas POSLEDNÍHO vibračního pojezdu v daném místě
-                vib_times = df_hist[df_hist['is_vibrating'] == True].groupby('spatial_index')['parsed_time'].max()
+                # Exaktní "flat earth" aproximace pouze pro účely přiřazení do metrické buňky pro určení historie
+                lat_f = 111320.0
+                lon_f = 111320.0 * np.cos(np.radians(avg_lat))
+                grid_s = 0.5
+                df_hist['bin_x'] = (df_hist['drum_lon'] * lon_f // grid_s)
+                df_hist['bin_y'] = (df_hist['drum_lat'] * lat_f // grid_s)
                 
-                # 3. Zjistíme čas POSLEDNÍHO statického pojezdu v daném místě
-                stat_times = df_hist[df_hist['is_vibrating'] == False].groupby('spatial_index')['parsed_time'].max()
+                # Zjištění, zda v dané buňce NĚKDY proběhla vibrace
+                vib_bins = df_hist[df_hist['is_vibrating'] == True][['bin_x', 'bin_y']].drop_duplicates()
+                vib_bins['ever_vibrated'] = True
                 
-                # 4. Logika historie: Je čas statiky > čas vibrace?
-                df_iron_check = pd.DataFrame({'last_vib': vib_times, 'last_stat': stat_times}).reset_index()
+                # Extrakce zcela posledního pojezdu pro každou fyzickou buňku
+                last_idx = df_hist.groupby(['bin_x', 'bin_y'])['parsed_time'].idxmax()
+                df_last = df_hist.loc[last_idx].copy()
                 
-                # Místa, kde se vibrovalo, ale NEžehlilo POTÉ
-                df_iron_check['ironed_ok'] = (df_iron_check['last_stat'].notna()) & (df_iron_check['last_stat'] > df_iron_check['last_vib'].fillna(pd.Timestamp.min.tz_localize('UTC')))
+                # Spojení informací
+                df_iron = df_last.merge(vib_bins, on=['bin_x', 'bin_y'], how='left')
+                df_iron['ever_vibrated'] = df_iron['ever_vibrated'].fillna(False)
                 
-                # Nyní propojíme tento status zpět k nejnovějšímu plošnému bodu dané oblasti, abychom měli rohy
-                idx_last_presence = df_hist.groupby('spatial_index')['parsed_time'].idxmax()
-                df_visual = df_hist.loc[idx_last_presence].merge(df_iron_check[['spatial_index', 'ironed_ok']], on='spatial_index', how='left')
-                df_visual['ironed_ok'] = df_visual['ironed_ok'].fillna(False)
+                # Logika: 
+                # Zelená (Vyžehleno): Někdy tam byla vibrace, ale ten úplně poslední pojezd byl statický
+                df_green = df_iron[(df_iron['is_vibrating'] == False) & (df_iron['ever_vibrated'] == True)]
                 
-                # Vykreslení reálných polygonů (Zelená = Správně uzavřeno na závěr, Červená = Zůstalo neuzavřené)
-                df_good = df_visual[df_visual['ironed_ok'] == True]
-                df_bad = df_visual[(df_visual['ironed_ok'] == False) & (df_visual['is_vibrating'] == True)] # Zajímá nás jen nedokončená vibrovaná plocha
+                # Červená (Riziko): Úplně poslední pojezd byl s vibrací (otevřený povrch)
+                df_red = df_iron[df_iron['is_vibrating'] == True]
                 
-                t_good = generuj_optimalizovany_polygon_trace(df_good, roller_width, segment_len, 'rgba(34, 197, 94, 0.7)', "Uzavřeno", colormap, 0, 1, "Úspěšně přežehleno")
-                t_bad = generuj_optimalizovany_polygon_trace(df_bad, roller_width, segment_len, 'rgba(239, 68, 68, 0.7)', "Riziko - Neuzavřeno", colormap, 0, 1, "Nedokončeno (Bez statiky)")
+                t_green = generuj_optimalizovany_polygon_trace(df_green, roller_width, 'rgba(34, 197, 94, 0.75)', colormap, 0, 1, "Uzavřeno (Statika na závěr)")
+                t_red = generuj_optimalizovany_polygon_trace(df_red, roller_width, 'rgba(239, 68, 68, 0.75)', colormap, 0, 1, "Otevřeno (Ukončeno vibrací)")
                 
-                if t_good: fig5.add_trace(t_good)
-                if t_bad: fig5.add_trace(t_bad)
+                if t_green: fig5.add_trace(t_green)
+                if t_red: fig5.add_trace(t_red)
                 
+                # Hover info
+                fig5.add_trace(go.Scattergl(
+                    x=df_iron['drum_lon'], y=df_iron['drum_lat'], mode='markers',
+                    marker=dict(color='black', size=2, opacity=0.05),
+                    hovertext="Lat: " + df_iron['drum_lat'].round(7).astype(str) + "<br>Lon: " + df_iron['drum_lon'].round(7).astype(str)
+                ))
+
             fig5.update_layout(yaxis=map_layout, height=700, margin=dict(l=0,r=0,t=0,b=0))
             st.plotly_chart(fig5, use_container_width=True)
 
