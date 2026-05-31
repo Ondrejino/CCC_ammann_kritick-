@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from pyproj import Geod
+from plotly.colors import sample_colorscale
 import io
 
 # --- 1. NASTAVENÍ APLIKACE ---
@@ -34,6 +35,38 @@ def najdi_vychozi_sloupec(columns, klicova_slova):
             if slovo in col.lower():
                 return col
     return columns[0] if len(columns) > 0 else None
+
+# MATEMATIKA PRO VYTVOŘENÍ GEOGRAFICKÝCH POLYGONŮ PÁSU
+def vytvor_geometrii_pasu(df, width_m, length_m, avg_lat):
+    df_geom = df.copy()
+    lon_factor = 111320 * np.cos(np.radians(avg_lat))
+    lat_factor = 111320
+    
+    # Úhly a vektory posunu podle heading
+    rad = np.radians(df_geom['heading'])
+    
+    # Směr vpřed a vzad (podélně)
+    fwd_e = np.sin(rad) * (length_m / 2)
+    fwd_n = np.cos(rad) * (length_m / 2)
+    
+    # Směr vlevo a vpravo (příčně k ose)
+    right_e = np.cos(rad) * (width_m / 2)
+    right_n = -np.sin(rad) * (width_m / 2)
+    
+    # Výpočet 4 rohů obdélníku pro každý bod
+    df_geom['c1_x'] = df_geom['corr_lon'] + (fwd_e + right_e) / lon_factor
+    df_geom['c1_y'] = df_geom['corr_lat'] + (fwd_n + right_n) / lat_factor
+    
+    df_geom['c2_x'] = df_geom['corr_lon'] + (fwd_e - right_e) / lon_factor
+    df_geom['c2_y'] = df_geom['corr_lat'] + (fwd_n - right_n) / lat_factor
+    
+    df_geom['c3_x'] = df_geom['corr_lon'] + (-fwd_e - right_e) / lon_factor
+    df_geom['c3_y'] = df_geom['corr_lat'] + (-fwd_n - right_n) / lat_factor
+    
+    df_geom['c4_x'] = df_geom['corr_lon'] + (-fwd_e + right_e) / lon_factor
+    df_geom['c4_y'] = df_geom['corr_lat'] + (-fwd_n + right_n) / lat_factor
+    
+    return df_geom
 
 # --- CACHOVANÉ GEOPROSTOROVÉ ZPRACOVÁNÍ ---
 @st.cache_data(show_spinner="Zpracovávám geodata, azimuty a pojezdy (počítá se jen jednou)...")
@@ -76,7 +109,7 @@ def zpracuj_geodata(df_raw, col_lat, col_lon, col_stiff, col_vib, col_time, col_
     is_forward = (df[col_dir].astype(str) == "1").values
     machine_heading = np.where(is_forward, fwd_az, (fwd_az + 180) % 360)
     
-    # PŘIDÁNO: Uložení azimutu do datasetu pro rotaci čtverců
+    # Uložení úhlu pro vykreslování geometrie obrysů
     df['heading'] = machine_heading
     
     # --- MATEMATIKA L-tvaru ---
@@ -136,7 +169,9 @@ with st.sidebar:
         
         st.header("5. Vizuál")
         colormap = st.selectbox("Paleta Heatmapy", ['Turbo', 'Viridis', 'Plasma', 'Inferno', 'Jet'], index=0)
-        track_size = st.slider("Šířka vykresleného pásu v Mapách 2 a 5", min_value=10, max_value=50, value=22, step=1)
+        roller_width_m = st.number_input("Šířka běhounu pro vykreslení pásu (m)", value=2.1, step=0.1)
+        segment_length_m = st.number_input("Délka segmentu pro pás (m) [ideálně rovno mřížce]", value=1.0, step=0.1)
+
 
 # --- 4. HLAVNÍ VÝPOČETNÍ LOGIKA ---
 if uploaded_file is not None:
@@ -156,13 +191,13 @@ if uploaded_file is not None:
         
         df_current = df_valid[df_valid['pass_id'] <= selected_pass].copy()
         
+        # Mřížka
         lat_step = grid_size_m / 111320
         lon_step = grid_size_m / (111320 * np.cos(np.radians(avg_lat)))
         df_current['lat_bin'] = (df_current['corr_lat'] // lat_step) * lat_step + (lat_step / 2)
         df_current['lon_bin'] = (df_current['corr_lon'] // lon_step) * lon_step + (lon_step / 2)
         
         df_vib = df_current[(df_current['is_vibrating'] == True) & (df_current[col_stiff].notna())].copy()
-        
         df_current_sorted = df_current.sort_values('parsed_time')
 
         tab1, tab2, tab3, tab4, tab5 = st.tabs([
@@ -191,32 +226,54 @@ if uploaded_file is not None:
             st.plotly_chart(fig_raw, use_container_width=True)
 
         with tab2:
-            st.subheader("Mapa finální kvality (Poslední platný pojezd na daném místě)")
-            st.caption("Zobrazuje se orientovaný obrys válce a středová tečka pro finální průjezd.")
+            st.subheader("Mapa finální kvality (Geometrický pás z posledních pojezdů)")
             fig_final = go.Figure()
+            
             if not df_vib.empty:
                 df_vib_sorted = df_vib.sort_values('parsed_time')
-                # Místo agregace průměru na mřížku vytáhneme přesný INDEX posledního záznamu v každé buňce
+                
+                # Vybereme jen úplně poslední hodnotu z každé buňky (jak jsi psal "jen poslední pojezdy")
                 idx_last = df_vib_sorted.groupby(['lat_bin', 'lon_bin'])['parsed_time'].idxmax()
-                df_final = df_vib.loc[idx_last].copy()
+                df_final = df_vib_sorted.loc[idx_last].copy()
                 
-                # Vrstva 1: Široký barevný pás (Natočený čtverec podle azimutu)
-                # Odezva azimutu v Plotly je CCW, takže dáváme minus
+                # Výpočet geometrie (4 prostorové souřadnice pro každý punkt)
+                df_final = vytvor_geometrii_pasu(df_final, roller_width_m, segment_length_m, avg_lat)
+                
+                # Plotly neumí u polygonů "fill='toself'" pracovat se spojitou colorbar snadno,
+                # rozdělíme data do 20 barevných baret (bins), to renderování vůbec nezpomalí.
+                bins = 20
+                min_kb, max_kb = df_final[col_stiff].min(), df_final[col_stiff].max()
+                if min_kb == max_kb: max_kb += 0.1
+                df_final['color_bin'] = np.clip(np.floor((df_final[col_stiff] - min_kb) / (max_kb - min_kb) * bins), 0, bins - 1)
+                
+                for b in range(bins):
+                    df_bin = df_final[df_final['color_bin'] == b]
+                    if df_bin.empty: continue
+                    
+                    # Přiřazení hex barvy z colormapy podle hodnoty binu
+                    norm_val = (b + 0.5) / bins
+                    hex_color = sample_colorscale(colormap.lower(), norm_val)[0]
+                    
+                    c1x, c1y = df_bin['c1_x'].values, df_bin['c1_y'].values
+                    c2x, c2y = df_bin['c2_x'].values, df_bin['c2_y'].values
+                    c3x, c3y = df_bin['c3_x'].values, df_bin['c3_y'].values
+                    c4x, c4y = df_bin['c4_x'].values, df_bin['c4_y'].values
+                    
+                    x_vals, y_vals = [], []
+                    for i in range(len(c1x)):
+                        x_vals.extend([c1x[i], c2x[i], c3x[i], c4x[i], c1x[i], None])
+                        y_vals.extend([c1y[i], c2y[i], c3y[i], c4y[i], c1y[i], None])
+                    
+                    # Vrstva 1: Souvislý barevný pás z polygonů (odolný proti zoomování!)
+                    fig_final.add_trace(go.Scatter(
+                        x=x_vals, y=y_vals, fill='toself', mode='lines', 
+                        line=dict(width=0), fillcolor=hex_color, hoverinfo='skip', showlegend=False, opacity=0.85
+                    ))
+                
+                # Vrstva 2: Tečka (střed/poslední hodnota pojezdu) – dodá barvu a přesný hover info
                 fig_final.add_trace(go.Scatter(
                     x=df_final['corr_lon'], y=df_final['corr_lat'], mode='markers',
-                    marker=dict(
-                        symbol='square', size=track_size, opacity=0.7,
-                        angle=-df_final['heading'], # Kouzlo natočení
-                        color=df_final[col_stiff], colorscale=colormap,
-                        showscale=True, colorbar=dict(title="Finální Kb [-]")
-                    ),
-                    hoverinfo='skip', showlegend=False
-                ))
-                
-                # Vrstva 2: Středová tečka jako základ
-                fig_final.add_trace(go.Scatter(
-                    x=df_final['corr_lon'], y=df_final['corr_lat'], mode='markers',
-                    marker=dict(symbol='circle', size=4, color='black', opacity=0.8),
+                    marker=dict(symbol='circle', size=4, color=df_final[col_stiff], colorscale=colormap, showscale=True, colorbar=dict(title="Finální Kb [-]")),
                     hovertext="Finální Kb: " + df_final[col_stiff].round(1).astype(str) + " | Pojezd: " + df_final['pass_id'].astype(str),
                     name='Střed běhounu'
                 ))
@@ -229,7 +286,6 @@ if uploaded_file is not None:
             st.plotly_chart(fig_final, use_container_width=True)
 
         with tab3:
-            # Původní nezměněný kód
             st.subheader(f"Mapa Anomálií (Po pojezdu {selected_pass})")
             fig_anom = go.Figure()
             
@@ -264,7 +320,6 @@ if uploaded_file is not None:
             st.plotly_chart(fig_anom, use_container_width=True)
 
         with tab4:
-            # Původní nezměněný kód
             st.subheader(f"Statistický vývoj (Do pojezdu {selected_pass})")
             fig_hist = go.Figure()
             if not df_vib.empty:
@@ -289,7 +344,6 @@ if uploaded_file is not None:
 
         with tab5:
             st.subheader("Analýza statického žehlení vrstvy")
-            st.caption("Filtrujeme přesné hraniční body a zakreslujeme je po směru jízdy.")
             
             ironing_mode = st.radio(
                 "Vyberte typ technologické kontroly:",
@@ -299,13 +353,11 @@ if uploaded_file is not None:
             
             if not df_current_sorted.empty:
                 if "Finální" in ironing_mode:
-                    # Chceme ÚPLNĚ POSLEDNÍ průjezd na daném místě
                     idx_iron = df_current_sorted.groupby(['lat_bin', 'lon_bin'])['parsed_time'].idxmax()
                     label_true = "Finálně přežehleno (Zavřeno)"
                     label_false = "Nepřežehleno na závěr (Zůstalo otevřené)"
                     metric_title = "Plocha úspěšně finálně uzavřena staticky"
                 else:
-                    # Chceme ÚPLNĚ PRVNÍ průjezd na daném místě
                     idx_iron = df_current_sorted.groupby(['lat_bin', 'lon_bin'])['parsed_time'].idxmin()
                     label_true = "Úvodně přežehleno (Stabilizováno staticky)"
                     label_false = "Započato rovnou s vibrací (Riziko)"
@@ -314,23 +366,32 @@ if uploaded_file is not None:
                 df_ironing = df_current_sorted.loc[idx_iron].copy()
                 df_ironing['Selected_Status'] = df_ironing['is_vibrating'] == False
                 
-                colors_iron = np.where(df_ironing['Selected_Status'], '#22c55e', '#ef4444')
-                labels_iron = np.where(df_ironing['Selected_Status'], label_true, label_false)
-
+                # Vypočítáme obdélníky
+                df_ironing = vytvor_geometrii_pasu(df_ironing, roller_width_m, segment_length_m, avg_lat)
                 fig_iron = go.Figure()
                 
-                # Vrstva 1: Široký pás (Natočený obrys válce)
-                fig_iron.add_trace(go.Scatter(
-                    x=df_ironing['corr_lon'], y=df_ironing['corr_lat'], mode='markers',
-                    marker=dict(
-                        symbol='square', size=track_size, opacity=0.7,
-                        angle=-df_ironing['heading'],
-                        color=colors_iron
-                    ),
-                    hoverinfo='skip'
-                ))
+                # Vrstva 1: Geometrické polygony (True = zelená, False = červená)
+                for status, poly_color in [(True, 'rgba(34, 197, 94, 0.75)'), (False, 'rgba(239, 68, 68, 0.75)')]:
+                    df_sub = df_ironing[df_ironing['Selected_Status'] == status]
+                    if df_sub.empty: continue
+                    
+                    c1x, c1y = df_sub['c1_x'].values, df_sub['c1_y'].values
+                    c2x, c2y = df_sub['c2_x'].values, df_sub['c2_y'].values
+                    c3x, c3y = df_sub['c3_x'].values, df_sub['c3_y'].values
+                    c4x, c4y = df_sub['c4_x'].values, df_sub['c4_y'].values
+                    
+                    x_vals, y_vals = [], []
+                    for i in range(len(c1x)):
+                        x_vals.extend([c1x[i], c2x[i], c3x[i], c4x[i], c1x[i], None])
+                        y_vals.extend([c1y[i], c2y[i], c3y[i], c4y[i], c1y[i], None])
+                        
+                    fig_iron.add_trace(go.Scatter(
+                        x=x_vals, y=y_vals, fill='toself', mode='lines', 
+                        line=dict(width=0), fillcolor=poly_color, hoverinfo='skip', showlegend=False
+                    ))
                 
-                # Vrstva 2: Středová tečka 
+                # Vrstva 2: Tečky a popisky
+                labels_iron = np.where(df_ironing['Selected_Status'], label_true, label_false)
                 fig_iron.add_trace(go.Scatter(
                     x=df_ironing['corr_lon'], y=df_ironing['corr_lat'], mode='markers',
                     marker=dict(symbol='circle', size=4, color='black', opacity=0.8),
