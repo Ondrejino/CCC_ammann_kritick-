@@ -10,8 +10,8 @@ import csv
 
 # --- 1. NASTAVENÍ APLIKACE ---
 st.set_page_config(page_title="CCC Detektor: Finální Rasterizace", layout="wide")
-st.title(" CCC Detektor ")
-st.caption("Hahaha")
+st.title("🚜 CCC Detektor: Profesionální plošná rasterizace (V7)")
+st.caption("Aplikace optimalizovaná pro inženýrskou praxi (Zeminy F6). Včetně analýzy historických rizik a tvorby krusty.")
 
 # --- 2. DATA PARSER ---
 @st.cache_data(show_spinner="Analyzuji hlavičky a načítám surová data...")
@@ -196,7 +196,6 @@ with st.sidebar:
         col_speed = st.selectbox("Rychlost", ["Vypočítat z GPS"] + list(df_raw.columns), index=0)
 
         st.header("📐 3. Stroj a Rastrování")
-        # Výchozí hodnoty nastaveny podle požadavku (2.65 dopředu, 0.26 do boku)
         offset_fwd = st.number_input("Posun antény podélně (m)", value=2.65, step=0.05)
         offset_right = st.number_input("Posun antény příčně (m)", value=0.26, step=0.01, help="Kladné = doprava, Záporné = doleva")
         roller_width = st.number_input("Šířka běhounu (m)", value=2.13, step=0.01)
@@ -256,7 +255,7 @@ if uploaded_file is not None:
         map_layout = dict(scaleanchor="x", scaleratio=cos_corr, tickformat=".7f", hoverformat=".7f")
 
         tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-            "🗺️ 1. Raw Trasa", "🔥 2. Překryvy", "🟩 3. Finální Tuhost", "🔴 4. Anomálie (Bodově)", "📊 5. Statistika", "🧊 6. Žehlení"
+            "🗺️ 1. Raw Trasa", "🔥 2. Překryvy", "🟩 3. Finální Tuhost", "🔴 4. Historická Anomálie", "📊 5. Statistika", "🧊 6. Žehlení"
         ])
 
         with tab1:
@@ -281,7 +280,6 @@ if uploaded_file is not None:
                 for c in range(1, max_count + 1):
                     df_c = df_counts[df_counts['pass_count'] == c]
                     trace = generuj_mrizku_trace(df_c, grid_size, avg_lat, c, 'hot', 0, max_count + 1, f"{c} Přejezdů")
-                    # Přepsání showlegend pro tabulku překryvů, abychom viděli barvy
                     if trace: 
                         trace.showlegend = True
                         fig2.add_trace(trace)
@@ -313,7 +311,6 @@ if uploaded_file is not None:
                         trace = generuj_mrizku_trace(df_bin, grid_size, avg_lat, val_center, colormap, zmin, zmax, f"Kb ~{val_center:.0f}")
                         if trace: fig3.add_trace(trace)
                     
-                    # Trik pro zobrazení plynulé legendy (Colorbar) k polygonům
                     fig3.add_trace(go.Scatter(
                         x=[None], y=[None], mode='markers',
                         marker=dict(colorscale=colormap, cmin=zmin, cmax=zmax, showscale=True, colorbar=dict(title="Kb [-]")),
@@ -329,35 +326,56 @@ if uploaded_file is not None:
             st.plotly_chart(fig3, use_container_width=True)
 
         with tab4:
-            st.subheader("Anomálie z finální plochy (Přesné body)")
-            st.caption("Plocha je vykreslena bodově pro snadné zacílení a vytyčení souřadnic s přesností na 7 desetinných míst.")
+            st.subheader("Analýza historických rizik a krusty (Bodově)")
+            st.caption("Odhaluje místa s vytvořenou povrchovou krustou. Oranžové body = Finální pojezd v normě, ale v historii měřeno pod limitem.")
             fig4 = go.Figure()
-            if not df_current_raster.empty and not df_vib_raster.empty:
-                df_under = df_final[df_final['kb'] < target_min]
-                df_over = df_final[df_final['kb'] > target_max]
-                df_ok = df_final[(df_final['kb'] >= target_min) & (df_final['kb'] <= target_max)]
-                
-                # Zobrazení anomálií jako bodů (Scatter) s přesným textem místo plošných čtverečků
-                if not df_ok.empty:
-                    fig4.add_trace(go.Scattergl(x=df_ok['cell_lon'], y=df_ok['cell_lat'], mode='markers', marker=dict(color='#E5E7EB', size=6), name="V normě",
-                        hovertext="Lat: " + df_ok['cell_lat'].round(7).astype(str) + "<br>Lon: " + df_ok['cell_lon'].round(7).astype(str) + "<br>Kb: " + df_ok['kb'].round(1).astype(str)))
-                if not df_under.empty:
-                    fig4.add_trace(go.Scattergl(x=df_under['cell_lon'], y=df_under['cell_lat'], mode='markers', marker=dict(color='rgba(239, 68, 68, 0.9)', size=7), name="Nedohutněno",
-                        hovertext="Lat: " + df_under['cell_lat'].round(7).astype(str) + "<br>Lon: " + df_under['cell_lon'].round(7).astype(str) + "<br>Kb: " + df_under['kb'].round(1).astype(str)))
-                if not df_over.empty:
-                    fig4.add_trace(go.Scattergl(x=df_over['cell_lon'], y=df_over['cell_lat'], mode='markers', marker=dict(color='rgba(59, 130, 246, 0.9)', size=7), name="Přezhutněno",
-                        hovertext="Lat: " + df_over['cell_lat'].round(7).astype(str) + "<br>Lon: " + df_over['cell_lon'].round(7).astype(str) + "<br>Kb: " + df_over['kb'].round(1).astype(str)))
+            if not df_current_raster.empty:
+                df_vib_raster = df_current_raster[df_current_raster['is_vib'] == True]
+                if not df_vib_raster.empty:
+                    # 1. Zjištění historického minima
+                    df_hist_min = df_vib_raster.groupby(['cell_lon', 'cell_lat'])['kb'].min().reset_index(name='min_kb_history')
+                    
+                    # 2. Získání finální vrstvy
+                    idx_last = df_vib_raster.groupby(['cell_lon', 'cell_lat'])['time'].idxmax()
+                    df_final = df_vib_raster.loc[idx_last].copy()
+                    
+                    # 3. Spojení historie s finálním pojezdem
+                    df_anom = df_final.merge(df_hist_min, on=['cell_lon', 'cell_lat'])
+                    
+                    # 4. Rozdělení do kategorií
+                    df_active_under = df_anom[df_anom['kb'] < target_min]
+                    df_over = df_anom[df_anom['kb'] > target_max]
+                    df_ok = df_anom[(df_anom['kb'] >= target_min) & (df_anom['kb'] <= target_max) & (df_anom['min_kb_history'] >= target_min)]
+                    df_healed = df_anom[(df_anom['kb'] >= target_min) & (df_anom['kb'] <= target_max) & (df_anom['min_kb_history'] < target_min)]
+                    
+                    # Z-index: Aby důležité anomálie nezapadly pod šedé body
+                    if not df_ok.empty:
+                        fig4.add_trace(go.Scattergl(x=df_ok['cell_lon'], y=df_ok['cell_lat'], mode='markers', marker=dict(color='#E5E7EB', size=5), name="V normě (Trvale)",
+                            hovertext="Lat: " + df_ok['cell_lat'].round(7).astype(str) + "<br>Lon: " + df_ok['cell_lon'].round(7).astype(str) + "<br>Finální Kb: " + df_ok['kb'].round(1).astype(str) + "<br>Min. historie: " + df_ok['min_kb_history'].round(1).astype(str)))
+                    if not df_healed.empty:
+                        fig4.add_trace(go.Scattergl(x=df_healed['cell_lon'], y=df_healed['cell_lat'], mode='markers', marker=dict(color='orange', size=8, symbol='diamond'), name="Vyléčené nedohutnění (Riziko krusty)",
+                            hovertext="Lat: " + df_healed['cell_lat'].round(7).astype(str) + "<br>Lon: " + df_healed['cell_lon'].round(7).astype(str) + "<br>Finální Kb: " + df_healed['kb'].round(1).astype(str) + "<br>Min. historie: " + df_healed['min_kb_history'].round(1).astype(str)))
+                    if not df_over.empty:
+                        fig4.add_trace(go.Scattergl(x=df_over['cell_lon'], y=df_over['cell_lat'], mode='markers', marker=dict(color='rgba(59, 130, 246, 0.9)', size=7), name="Aktivní přezhutnění",
+                            hovertext="Lat: " + df_over['cell_lat'].round(7).astype(str) + "<br>Lon: " + df_over['cell_lon'].round(7).astype(str) + "<br>Finální Kb: " + df_over['kb'].round(1).astype(str)))
+                    if not df_active_under.empty:
+                        fig4.add_trace(go.Scattergl(x=df_active_under['cell_lon'], y=df_active_under['cell_lat'], mode='markers', marker=dict(color='rgba(239, 68, 68, 0.9)', size=7), name="Aktivní nedohutnění",
+                            hovertext="Lat: " + df_active_under['cell_lat'].round(7).astype(str) + "<br>Lon: " + df_active_under['cell_lon'].round(7).astype(str) + "<br>Finální Kb: " + df_active_under['kb'].round(1).astype(str)))
 
-            fig4.update_layout(yaxis=map_layout, height=700, margin=dict(l=0,r=0,t=0,b=0), showlegend=True)
+            fig4.update_layout(yaxis=map_layout, height=700, margin=dict(l=0,r=0,t=0,b=0), showlegend=True, legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01))
             st.plotly_chart(fig4, use_container_width=True)
 
         with tab5:
             st.subheader("Plošná distribuce tuhosti (Kb)")
-            if not df_current_raster.empty and not df_vib_raster.empty:
-                fig5 = go.Figure(go.Histogram(x=df_final['kb'], nbinsx=60, marker_color='slategray'))
-                fig5.add_vrect(x0=target_min, x1=target_max, fillcolor="green", opacity=0.2)
-                fig5.update_layout(xaxis_title="Kb", yaxis_title="Rozloha (Počet buněk mřížky)")
-                st.plotly_chart(fig5, use_container_width=True)
+            if not df_current_raster.empty:
+                df_vib_raster = df_current_raster[df_current_raster['is_vib'] == True]
+                if not df_vib_raster.empty:
+                    idx_last = df_vib_raster.groupby(['cell_lon', 'cell_lat'])['time'].idxmax()
+                    df_final = df_vib_raster.loc[idx_last].copy()
+                    fig5 = go.Figure(go.Histogram(x=df_final['kb'], nbinsx=60, marker_color='slategray'))
+                    fig5.add_vrect(x0=target_min, x1=target_max, fillcolor="green", opacity=0.2)
+                    fig5.update_layout(xaxis_title="Kb", yaxis_title="Rozloha (Počet buněk mřížky)")
+                    st.plotly_chart(fig5, use_container_width=True)
 
         with tab6:
             st.subheader("Chronologická kontrola uzavření povrchu")
@@ -390,7 +408,6 @@ if uploaded_file is not None:
                     showlegend=False
                 ))
 
-            # Zapnutí zobrazení legendy u žehlení
             fig6.update_layout(yaxis=map_layout, height=700, margin=dict(l=0,r=0,t=0,b=0), showlegend=True, legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01))
             st.plotly_chart(fig6, use_container_width=True)
 
