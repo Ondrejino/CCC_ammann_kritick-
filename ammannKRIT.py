@@ -9,9 +9,9 @@ import io
 import csv
 
 # --- 1. NASTAVENÍ APLIKACE ---
-st.set_page_config(page_title="CCC Detektor: Finální Rasterizace", layout="wide")
-st.title("🚜 CCC Detektor: Profesionální plošná rasterizace (V7)")
-st.caption("Aplikace optimalizovaná pro inženýrskou praxi (Zeminy F6). Včetně analýzy historických rizik a tvorby krusty.")
+st.set_page_config(page_title="CCC Detektor", layout="wide")
+st.title("CCC Detektor")
+st.caption("Aplikace navržená pro analýzu CCC pro účely diplomové práce.")
 
 # --- 2. DATA PARSER ---
 @st.cache_data(show_spinner="Analyzuji hlavičky a načítám surová data...")
