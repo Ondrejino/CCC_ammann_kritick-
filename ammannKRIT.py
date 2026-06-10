@@ -11,7 +11,7 @@ import csv
 # --- 1. NASTAVENÍ APLIKACE ---
 st.set_page_config(page_title="CCC Detektor", layout="wide")
 st.title("CCC Detektor")
-st.caption("Aplikace navržená pro analýzu CCC pro účely diplomové práce.")
+st.caption("Aplikace navržená pro analýzu CCC pro účely diplomové práce. (Geometricky a korelačně optimalizováno)")
 
 # --- 2. DATA PARSER ---
 @st.cache_data(show_spinner="Analyzuji hlavičky a načítám surová data...")
@@ -80,8 +80,18 @@ def zpracuj_geodata(df_raw, col_lat, col_lon, col_stiff, col_vib, col_time, col_
     fwd_az, _, _ = geod.inv(df['smooth_lon'].shift(step).bfill().values, df['smooth_lat'].shift(step).bfill().values, df['smooth_lon'].values, df['smooth_lat'].values)
     df['heading'] = fwd_az % 360
     
+    # --- 1. OPRAVA: OTOČENÍ AZIMUTU PŘI COUVÁNÍ ---
+    # Pokud sloupec existuje a hodnota začíná na '2', otočíme směr stroje o 180 stupňů
+    if col_dir in df.columns:
+        is_reverse = df[col_dir].astype(str).str.strip().str.startswith('2')
+        df.loc[is_reverse, 'heading'] = (df.loc[is_reverse, 'heading'] + 180) % 360
+    
+    # Podélný posun do středu běhounu (nyní funguje správně vpřed i vzad)
     temp_lon, temp_lat, _ = geod.fwd(df[col_lon].values, df[col_lat].values, df['heading'].values, np.full(len(df), offset_fwd))
-    heading_right = (df['heading'] - 90) % 360 if offset_right < 0 else (df['heading'] + 90) % 360
+    
+    # --- 2. OPRAVA: SPRÁVNÁ ORIENTACE PŘÍČNÉHO OFFSETU ---
+    # Anténa vpravo (+) -> střed běhounu vlevo (-90 stupňů)
+    heading_right = (df['heading'] + 90) % 360 if offset_right < 0 else (df['heading'] - 90) % 360
     df['drum_lon'], df['drum_lat'], _ = geod.fwd(temp_lon, temp_lat, heading_right, np.full(len(df), abs(offset_right)))
 
     df['dt'] = df['parsed_time'].diff().dt.total_seconds().replace(0, 0.01).bfill()
@@ -111,7 +121,7 @@ def zpracuj_geodata(df_raw, col_lat, col_lon, col_stiff, col_vib, col_time, col_
     return df_valid
 
 # --- 4. EXAKTNÍ RASTERIZACE PŘES MATPLOTLIB PATH ---
-@st.cache_data(show_spinner="Rasterizuji polygony a otisky šířky běhounu (Ověřování přesahů)...")
+@st.cache_data(show_spinner="Rasterizuji polygony a otisky šířky běhounu...")
 def rasterizuj_do_mrizky(df, grid_size, avg_lat, col_stiff):
     df_work = df[['c1x', 'c1y', 'c2x', 'c2y', 'c3x', 'c3y', 'c4x', 'c4y', 'pass_id', 'is_vibrating', col_stiff, 'parsed_time']].copy()
     df_work.columns = ['c1x', 'c1y', 'c2x', 'c2y', 'c3x', 'c3y', 'c4x', 'c4y', 'pass_id', 'is_vib', 'kb', 'time']
@@ -196,6 +206,7 @@ with st.sidebar:
         col_speed = st.selectbox("Rychlost", ["Vypočítat z GPS"] + list(df_raw.columns), index=0)
 
         st.header("📐 3. Stroj a Rastrování")
+        # Výchozí hodnoty přímo podle nákresu
         offset_fwd = st.number_input("Posun antény podélně (m)", value=2.65, step=0.05)
         offset_right = st.number_input("Posun antény příčně (m)", value=0.26, step=0.01, help="Kladné = doprava, Záporné = doleva")
         roller_width = st.number_input("Šířka běhounu (m)", value=2.13, step=0.01)
@@ -206,6 +217,21 @@ with st.sidebar:
         target_min = st.number_input("Minimální Kb:", value=25.0, step=1.0)
         target_max = st.number_input("Maximální Kb:", value=50.0, step=1.0)
         colormap = st.selectbox("Paleta Kb", ['Turbo', 'Viridis', 'Jet'], index=0)
+        
+        st.header("📍 5. Kontrolní zkoušky")
+        st.caption("Korelace s reálnými testy na stavbě")
+        zobrazit_krize = st.checkbox("Vykreslit body v mapě a zjistit Kb", value=False)
+        
+        kontrolni_body = []
+        with st.expander("Zadat souřadnice bodů (Až 5 bodů)"):
+            for i in range(1, 6):
+                st.markdown(f"**Zkouška {i}**")
+                col1, col2 = st.columns(2)
+                with col1:
+                    lat_val = st.number_input(f"Lat {i}", format="%.7f", value=0.0, key=f"lat_{i}")
+                with col2:
+                    lon_val = st.number_input(f"Lon {i}", format="%.7f", value=0.0, key=f"lon_{i}")
+                kontrolni_body.append({"id": i, "lat": lat_val, "lon": lon_val})
 
 # --- 6. RENDER SÍŤOVÝCH BUNĚK V PLOTLY ---
 def generuj_mrizku_trace(df_grid, cell_size_m, avg_lat, color_val, color_scale, zmin, zmax, name):
@@ -252,6 +278,7 @@ if uploaded_file is not None:
         df_current_raster = df_raster[df_raster['pass_id'] <= selected_pass].copy()
         
         cos_corr = 1 / np.cos(np.radians(avg_lat))
+        # Původní normální layout (bez převrácení Y)
         map_layout = dict(scaleanchor="x", scaleratio=cos_corr, tickformat=".7f", hoverformat=".7f")
 
         tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
@@ -263,12 +290,17 @@ if uploaded_file is not None:
             fig1 = go.Figure()
             df_v = df_valid[df_valid['pass_id'] <= selected_pass]
             if not df_v.empty:
+                # OCHRANA PROHLÍŽEČE: Decimace bodů
+                step = max(1, len(df_v) // 4000)
+                df_v_render = df_v.iloc[::step]
+                
                 fig1.add_trace(go.Scattergl(
-                    x=df_v['drum_lon'], y=df_v['drum_lat'], mode='markers',
-                    marker=dict(size=4, color=df_v[col_stiff], colorscale=colormap, showscale=True, colorbar=dict(title="Kb [-]")),
-                    hovertext="Kb: " + df_v[col_stiff].round(1).astype(str)
+                    x=df_v_render['drum_lon'], y=df_v_render['drum_lat'], mode='markers',
+                    marker=dict(size=4, color=df_v_render[col_stiff], colorscale=colormap, showscale=True, colorbar=dict(title="Kb [-]")),
+                    hovertext="Kb: " + df_v_render[col_stiff].round(1).astype(str)
                 ))
             fig1.update_layout(yaxis=map_layout, height=700, margin=dict(l=0,r=0,t=0,b=0))
+            fig1.update_xaxes(autorange="reversed") # Vodorovné převrácení
             st.plotly_chart(fig1, use_container_width=True)
 
         with tab2:
@@ -290,16 +322,21 @@ if uploaded_file is not None:
                     showlegend=False
                 ))
             fig2.update_layout(yaxis=map_layout, height=700, margin=dict(l=0,r=0,t=0,b=0), showlegend=True)
+            fig2.update_xaxes(autorange="reversed") # Vodorovné převrácení
             st.plotly_chart(fig2, use_container_width=True)
 
         with tab3:
             st.subheader("Finální povrchová tuhost (Kb)")
             fig3 = go.Figure()
+            
+            df_final_for_calc = pd.DataFrame() # Pomocná proměnná pro tabulku
+            
             if not df_current_raster.empty:
                 df_vib_raster = df_current_raster[df_current_raster['is_vib'] == True]
                 if not df_vib_raster.empty:
                     idx_last = df_vib_raster.groupby(['cell_lon', 'cell_lat'])['time'].idxmax()
-                    df_final = df_vib_raster.loc[idx_last].copy()
+                    df_final = df_vib_raster.loc[idx_last].copy().reset_index(drop=True)
+                    df_final_for_calc = df_final # Uložení pro výpočet vzdáleností
                     
                     bins = 15
                     zmin, zmax = target_min - 5, target_max + 5
@@ -322,8 +359,64 @@ if uploaded_file is not None:
                         hovertext="Kb (Vyhlazeno): " + df_final['kb'].round(1).astype(str) + "<br>Lat: " + df_final['cell_lat'].round(7).astype(str) + "<br>Lon: " + df_final['cell_lon'].round(7).astype(str),
                         showlegend=False
                     ))
+                    
+                    # --- VYKRESLENÍ KŘÍŽKŮ V MAPĚ ---
+                    if zobrazit_krize:
+                        for pt in kontrolni_body:
+                            if pt["lat"] != 0.0 and pt["lon"] != 0.0:
+                                fig3.add_trace(go.Scattergl(
+                                    x=[pt["lon"]], y=[pt["lat"]],
+                                    mode='markers+text',
+                                    marker=dict(
+                                        symbol='cross', size=16, color='black', 
+                                        line=dict(color='white', width=2)
+                                    ),
+                                    text=[str(pt["id"])],
+                                    textposition="top right",
+                                    textfont=dict(color="white", size=14, weight="bold"),
+                                    name=f"Zkouška {pt['id']}",
+                                    hovertext=f"📍 Místo zkoušky {pt['id']}<br>Lat: {pt['lat']}<br>Lon: {pt['lon']}",
+                                    showlegend=False
+                                ))
+
             fig3.update_layout(yaxis=map_layout, height=700, margin=dict(l=0,r=0,t=0,b=0), showlegend=False)
+            fig3.update_xaxes(autorange="reversed") # Vodorovné převrácení
             st.plotly_chart(fig3, use_container_width=True)
+            
+            # --- AUTOMATICKÁ KORELAČNÍ TABULKA ---
+            if zobrazit_krize and not df_final_for_calc.empty:
+                st.markdown("### 📊 Korelace: Hodnoty válce v místech zkoušek")
+                
+                lat_f = 111320.0
+                lon_f = 111320.0 * np.cos(np.radians(avg_lat))
+                
+                vysledky_zkousek = []
+                
+                for pt in kontrolni_body:
+                    if pt["lat"] != 0.0 and pt["lon"] != 0.0:
+                        dy = (df_final_for_calc['cell_lat'] - pt["lat"]) * lat_f
+                        dx = (df_final_for_calc['cell_lon'] - pt["lon"]) * lon_f
+                        vzdalenosti = np.sqrt(dx**2 + dy**2)
+                        
+                        nejblizsi_idx = vzdalenosti.idxmin()
+                        min_vzdalenost = vzdalenosti[nejblizsi_idx]
+                        nalezene_kb = df_final_for_calc.loc[nejblizsi_idx, 'kb']
+                        
+                        vysledky_zkousek.append({
+                            "Zkouška": f"Bod {pt['id']}",
+                            "Zadaná Lat": pt["lat"],
+                            "Zadaná Lon": pt["lon"],
+                            "Kb válce": round(nalezene_kb, 1),
+                            "Odchylka od středu buňky (m)": round(min_vzdalenost, 2)
+                        })
+                
+                if vysledky_zkousek:
+                    df_vysledky = pd.DataFrame(vysledky_zkousek)
+                    st.dataframe(df_vysledky, use_container_width=True)
+                    
+                    max_odchylka = df_vysledky["Odchylka od středu buňky (m)"].max()
+                    if max_odchylka > (grid_size * 2):
+                        st.warning(f"⚠️ Pozor: Některé body leží docela daleko (max {max_odchylka} m) od nejbližší projeté trasy válce. Zkontroluj si souřadnice!")
 
         with tab4:
             st.subheader("Analýza historických rizik a krusty (Bodově)")
@@ -332,23 +425,16 @@ if uploaded_file is not None:
             if not df_current_raster.empty:
                 df_vib_raster = df_current_raster[df_current_raster['is_vib'] == True]
                 if not df_vib_raster.empty:
-                    # 1. Zjištění historického minima
                     df_hist_min = df_vib_raster.groupby(['cell_lon', 'cell_lat'])['kb'].min().reset_index(name='min_kb_history')
-                    
-                    # 2. Získání finální vrstvy
                     idx_last = df_vib_raster.groupby(['cell_lon', 'cell_lat'])['time'].idxmax()
                     df_final = df_vib_raster.loc[idx_last].copy()
-                    
-                    # 3. Spojení historie s finálním pojezdem
                     df_anom = df_final.merge(df_hist_min, on=['cell_lon', 'cell_lat'])
                     
-                    # 4. Rozdělení do kategorií
                     df_active_under = df_anom[df_anom['kb'] < target_min]
                     df_over = df_anom[df_anom['kb'] > target_max]
                     df_ok = df_anom[(df_anom['kb'] >= target_min) & (df_anom['kb'] <= target_max) & (df_anom['min_kb_history'] >= target_min)]
                     df_healed = df_anom[(df_anom['kb'] >= target_min) & (df_anom['kb'] <= target_max) & (df_anom['min_kb_history'] < target_min)]
                     
-                    # Z-index: Aby důležité anomálie nezapadly pod šedé body
                     if not df_ok.empty:
                         fig4.add_trace(go.Scattergl(x=df_ok['cell_lon'], y=df_ok['cell_lat'], mode='markers', marker=dict(color='#E5E7EB', size=5), name="V normě (Trvale)",
                             hovertext="Lat: " + df_ok['cell_lat'].round(7).astype(str) + "<br>Lon: " + df_ok['cell_lon'].round(7).astype(str) + "<br>Finální Kb: " + df_ok['kb'].round(1).astype(str) + "<br>Min. historie: " + df_ok['min_kb_history'].round(1).astype(str)))
@@ -363,6 +449,7 @@ if uploaded_file is not None:
                             hovertext="Lat: " + df_active_under['cell_lat'].round(7).astype(str) + "<br>Lon: " + df_active_under['cell_lon'].round(7).astype(str) + "<br>Finální Kb: " + df_active_under['kb'].round(1).astype(str)))
 
             fig4.update_layout(yaxis=map_layout, height=700, margin=dict(l=0,r=0,t=0,b=0), showlegend=True, legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01))
+            fig4.update_xaxes(autorange="reversed") # Vodorovné převrácení
             st.plotly_chart(fig4, use_container_width=True)
 
         with tab5:
@@ -409,6 +496,7 @@ if uploaded_file is not None:
                 ))
 
             fig6.update_layout(yaxis=map_layout, height=700, margin=dict(l=0,r=0,t=0,b=0), showlegend=True, legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01))
+            fig6.update_xaxes(autorange="reversed") # Vodorovné převrácení
             st.plotly_chart(fig6, use_container_width=True)
 
     else:
