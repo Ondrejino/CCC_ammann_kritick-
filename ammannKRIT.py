@@ -31,7 +31,7 @@ def nacti_surova_data(file_bytes):
     header_line = lines[header_idx]
     try:
         sep = csv.Sniffer().sniff(header_line).delimiter
-    except Exception:  # Vylepšeno zachytávání výjimek
+    except Exception:  
         sep = ';' if header_line.count(';') > header_line.count(',') else ','
     
     df = pd.read_csv(io.BytesIO(file_bytes), sep=sep, skiprows=header_idx, on_bad_lines='skip', dtype=str, low_memory=False)
@@ -94,7 +94,6 @@ def zpracuj_geodata(df_raw, col_lat, col_lon, col_stiff, col_vib, col_time, col_
 
     df['dt'] = df['parsed_time'].diff().dt.total_seconds().replace(0, 0.01).bfill()
     
-    # Výpočet počáteční vzdálenosti pro zjištění rychlosti
     _, _, dist_initial = geod.inv(df['drum_lon'].shift().bfill().values, df['drum_lat'].shift().bfill().values, df['drum_lon'].values, df['drum_lat'].values)
     
     if col_speed != "Vypočítat z GPS":
@@ -105,20 +104,16 @@ def zpracuj_geodata(df_raw, col_lat, col_lon, col_stiff, col_vib, col_time, col_
 
     df['is_vibrating'] = pd.to_numeric(df[col_vib].astype(str).str.replace(',', '.'), errors='coerce').fillna(0) > 0.1
     
-    # Filtrace stojících bodů
     df_valid = df[df['speed_kmh'] >= min_speed_kmh].copy()
     
     if not df_valid.empty:
-        # Výpočet reálné step_dist až po filtraci
         _, _, dist_valid = geod.inv(df_valid['drum_lon'].shift().bfill().values, df_valid['drum_lat'].shift().bfill().values, df_valid['drum_lon'].values, df_valid['drum_lat'].values)
-        df_valid['step_dist'] = np.clip(dist_valid, 0.1, 10.0) # Zvýšen horní limit na 10 m pro krytí děr při vyšší rychlosti
+        df_valid['step_dist'] = np.clip(dist_valid, 0.1, 10.0) 
         
-        # Zohlednění změny vibrace pro nový pojezd
         dir_cond = df_valid[col_dir] != df_valid[col_dir].shift().bfill() if col_dir in df_valid.columns else False
         vib_cond = df_valid['is_vibrating'] != df_valid['is_vibrating'].shift().bfill()
         time_gap = df_valid['parsed_time'].diff().dt.total_seconds() > 30
         
-        # Rozdělení pass_id
         df_valid['pass_id'] = (time_gap | dir_cond | vib_cond).cumsum() + 1
         
         c1x, c1y, c2x, c2y, c3x, c3y, c4x, c4y = vytvor_geometrii_pasu(df_valid, roller_width)
@@ -136,7 +131,7 @@ def rasterizuj_do_mrizky(df, grid_size, avg_lat, col_stiff):
     df_work.columns = ['c1x', 'c1y', 'c2x', 'c2y', 'c3x', 'c3y', 'c4x', 'c4y', 'pass_id', 'is_vib', 'kb', 'time']
     
     lat_f = METERS_PER_DEGREE
-    lon_f = METERS_PER_DEGREE * np.cos(np.radians(avg_lat)) # Lokální flat-earth aproximace
+    lon_f = METERS_PER_DEGREE * np.cos(np.radians(avg_lat))
     
     c1x_m, c1y_m = df_work['c1x'].values * lon_f, df_work['c1y'].values * lat_f
     c2x_m, c2y_m = df_work['c2x'].values * lon_f, df_work['c2y'].values * lat_f
@@ -235,10 +230,8 @@ with st.sidebar:
         
         if uploaded_zkousky is not None:
             try:
-                # Automatická detekce oddělovače
                 df_zkousky = pd.read_csv(uploaded_zkousky, sep=None, engine='python')
                 
-                # Inteligentní hledání sloupců
                 col_nazev = next((c for c in df_zkousky.columns if any(k in str(c).lower() for k in ['nazev', 'název', 'id', 'bod'])), df_zkousky.columns[0])
                 col_lat_zk = next((c for c in df_zkousky.columns if any(k in str(c).lower() for k in ['lat', 'y'])), None)
                 col_lon_zk = next((c for c in df_zkousky.columns if any(k in str(c).lower() for k in ['lon', 'x'])), None)
@@ -412,7 +405,7 @@ if uploaded_file is not None:
             
             # --- AUTOMATICKÁ KORELAČNÍ TABULKA ---
             if zobrazit_krize and not df_final_for_calc.empty and kontrolni_body:
-                st.markdown("### 📊 Korelace: Hodnoty válce v místech zkoušek")
+                st.markdown("### 📊 Korelace: Hodnoty válce v místech zkoušek (včetně historie)")
                 
                 lat_f = METERS_PER_DEGREE
                 lon_f = METERS_PER_DEGREE * np.cos(np.radians(avg_lat))
@@ -428,21 +421,41 @@ if uploaded_file is not None:
                         if not vzdalenosti.empty:
                             nejblizsi_idx = vzdalenosti.idxmin()
                             min_vzdalenost = vzdalenosti[nejblizsi_idx]
-                            nalezene_kb = df_final_for_calc.loc[nejblizsi_idx, 'kb']
                             
-                            vysledky_zkousek.append({
+                            target_lon = df_final_for_calc.loc[nejblizsi_idx, 'cell_lon']
+                            target_lat = df_final_for_calc.loc[nejblizsi_idx, 'cell_lat']
+                            
+                            history_cell = df_vib_raster[(df_vib_raster['cell_lon'] == target_lon) & (df_vib_raster['cell_lat'] == target_lat)].sort_values('pass_id')
+                            
+                            zaznam = {
                                 "Zkouška (Název)": pt['id'],
                                 "Zadaná Lat": pt["lat"],
                                 "Zadaná Lon": pt["lon"],
-                                "Kb válce": round(nalezene_kb, 1),
-                                "Odchylka od středu buňky (m)": round(min_vzdalenost, 2)
-                            })
+                                "Odchylka od středu (m)": round(min_vzdalenost, 2),
+                                "Finální Kb": round(df_final_for_calc.loc[nejblizsi_idx, 'kb'], 1)
+                            }
+                            
+                            for _, row in history_cell.iterrows():
+                                pass_num = int(row['pass_id'])
+                                zaznam[f"Kb (Přejezd {pass_num})"] = round(row['kb'], 1)
+                                
+                            vysledky_zkousek.append(zaznam)
                 
                 if vysledky_zkousek:
                     df_vysledky = pd.DataFrame(vysledky_zkousek)
+                    
+                    zakladni_sloupce = ["Zkouška (Název)", "Zadaná Lat", "Zadaná Lon"]
+                    # Bezpečné seřazení dynamických sloupců podle čísla přejezdu
+                    prejezdy_sloupce = sorted([col for col in df_vysledky.columns if "Kb (Přejezd" in col], 
+                                              key=lambda x: int(x.replace("Kb (Přejezd ", "").replace(")", "")))
+                    konec_sloupce = ["Finální Kb", "Odchylka od středu (m)"]
+                    
+                    final_cols = zakladni_sloupce + prejezdy_sloupce + konec_sloupce
+                    df_vysledky = df_vysledky[final_cols]
+                    
                     st.dataframe(df_vysledky, use_container_width=True)
                     
-                    max_odchylka = df_vysledky["Odchylka od středu buňky (m)"].max()
+                    max_odchylka = df_vysledky["Odchylka od středu (m)"].max()
                     if max_odchylka > (grid_size * 2):
                         st.warning(f"⚠️ Pozor: Některé body leží docela daleko (max {max_odchylka} m) od nejbližší projeté trasy válce. Zkontroluj si souřadnice!")
 
