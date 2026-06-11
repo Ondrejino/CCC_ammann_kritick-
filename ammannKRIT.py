@@ -80,37 +80,43 @@ def zpracuj_geodata(df_raw, col_lat, col_lon, col_stiff, col_vib, col_time, col_
     fwd_az, _, _ = geod.inv(df['smooth_lon'].shift(step).bfill().values, df['smooth_lat'].shift(step).bfill().values, df['smooth_lon'].values, df['smooth_lat'].values)
     df['heading'] = fwd_az % 360
     
-    # --- 1. OPRAVA: OTOČENÍ AZIMUTU PŘI COUVÁNÍ ---
-    # Pokud sloupec existuje a hodnota začíná na '2', otočíme směr stroje o 180 stupňů
     if col_dir in df.columns:
         is_reverse = df[col_dir].astype(str).str.strip().str.startswith('2')
         df.loc[is_reverse, 'heading'] = (df.loc[is_reverse, 'heading'] + 180) % 360
     
-    # Podélný posun do středu běhounu (nyní funguje správně vpřed i vzad)
     temp_lon, temp_lat, _ = geod.fwd(df[col_lon].values, df[col_lat].values, df['heading'].values, np.full(len(df), offset_fwd))
     
-    # --- 2. OPRAVA: SPRÁVNÁ ORIENTACE PŘÍČNÉHO OFFSETU ---
-    # Anténa vpravo (+) -> střed běhounu vlevo (-90 stupňů)
     heading_right = (df['heading'] + 90) % 360 if offset_right < 0 else (df['heading'] - 90) % 360
     df['drum_lon'], df['drum_lat'], _ = geod.fwd(temp_lon, temp_lat, heading_right, np.full(len(df), abs(offset_right)))
 
     df['dt'] = df['parsed_time'].diff().dt.total_seconds().replace(0, 0.01).bfill()
-    _, _, dist = geod.inv(df['drum_lon'].shift().bfill().values, df['drum_lat'].shift().bfill().values, df['drum_lon'].values, df['drum_lat'].values)
-    df['step_dist'] = np.clip(dist, 0.1, 2.0)
+    
+    # Výpočet počáteční vzdálenosti pro zjištění rychlosti
+    _, _, dist_initial = geod.inv(df['drum_lon'].shift().bfill().values, df['drum_lat'].shift().bfill().values, df['drum_lon'].values, df['drum_lat'].values)
     
     if col_speed != "Vypočítat z GPS":
         df['speed_kmh'] = pd.to_numeric(df[col_speed].astype(str).str.replace(',', '.'), errors='coerce')
     else:
-        df['speed_kmh'] = (dist / df['dt']) * 3.6
+        df['speed_kmh'] = (dist_initial / df['dt']) * 3.6
         df['speed_kmh'] = df['speed_kmh'].rolling(3, min_periods=1, center=True).mean()
 
-    df['is_vibrating'] = df[col_vib].fillna(0) > 0.1
+    df['is_vibrating'] = pd.to_numeric(df[col_vib].astype(str).str.replace(',', '.'), errors='coerce').fillna(0) > 0.1
+    
+    # Filtrace stojících bodů
     df_valid = df[df['speed_kmh'] >= min_speed_kmh].copy()
     
     if not df_valid.empty:
+        # OPRAVA 2: Výpočet reálné step_dist až po filtraci. Zabrání to vzniku děr u menšího rastru.
+        _, _, dist_valid = geod.inv(df_valid['drum_lon'].shift().bfill().values, df_valid['drum_lat'].shift().bfill().values, df_valid['drum_lon'].values, df_valid['drum_lat'].values)
+        df_valid['step_dist'] = np.clip(dist_valid, 0.1, 5.0) # Zvýšený horní limit, aby pokryl vyhozené body
+        
+        # OPRAVA 1: Zohlednění změny vibrace pro nový pojezd.
         dir_cond = df_valid[col_dir] != df_valid[col_dir].shift().bfill() if col_dir in df_valid.columns else False
+        vib_cond = df_valid['is_vibrating'] != df_valid['is_vibrating'].shift().bfill()
         time_gap = df_valid['parsed_time'].diff().dt.total_seconds() > 30
-        df_valid['pass_id'] = (time_gap | dir_cond).cumsum() + 1
+        
+        # Rozdělení pass_id
+        df_valid['pass_id'] = (time_gap | dir_cond | vib_cond).cumsum() + 1
         
         c1x, c1y, c2x, c2y, c3x, c3y, c4x, c4y = vytvor_geometrii_pasu(df_valid, roller_width)
         df_valid['c1x'], df_valid['c1y'] = c1x, c1y
@@ -206,7 +212,6 @@ with st.sidebar:
         col_speed = st.selectbox("Rychlost", ["Vypočítat z GPS"] + list(df_raw.columns), index=0)
 
         st.header("📐 3. Stroj a Rastrování")
-        # Výchozí hodnoty přímo podle nákresu
         offset_fwd = st.number_input("Posun antény podélně (m)", value=2.65, step=0.05)
         offset_right = st.number_input("Posun antény příčně (m)", value=0.26, step=0.01, help="Kladné = doprava, Záporné = doleva")
         roller_width = st.number_input("Šířka běhounu (m)", value=2.13, step=0.01)
@@ -278,7 +283,6 @@ if uploaded_file is not None:
         df_current_raster = df_raster[df_raster['pass_id'] <= selected_pass].copy()
         
         cos_corr = 1 / np.cos(np.radians(avg_lat))
-        # Původní normální layout (bez převrácení Y)
         map_layout = dict(scaleanchor="x", scaleratio=cos_corr, tickformat=".7f", hoverformat=".7f")
 
         tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
@@ -290,7 +294,6 @@ if uploaded_file is not None:
             fig1 = go.Figure()
             df_v = df_valid[df_valid['pass_id'] <= selected_pass]
             if not df_v.empty:
-                # OCHRANA PROHLÍŽEČE: Decimace bodů
                 step = max(1, len(df_v) // 4000)
                 df_v_render = df_v.iloc[::step]
                 
@@ -300,7 +303,7 @@ if uploaded_file is not None:
                     hovertext="Kb: " + df_v_render[col_stiff].round(1).astype(str)
                 ))
             fig1.update_layout(yaxis=map_layout, height=700, margin=dict(l=0,r=0,t=0,b=0))
-            fig1.update_xaxes(autorange="reversed") # Vodorovné převrácení
+            fig1.update_xaxes(autorange="reversed")
             st.plotly_chart(fig1, use_container_width=True)
 
         with tab2:
@@ -322,21 +325,25 @@ if uploaded_file is not None:
                     showlegend=False
                 ))
             fig2.update_layout(yaxis=map_layout, height=700, margin=dict(l=0,r=0,t=0,b=0), showlegend=True)
-            fig2.update_xaxes(autorange="reversed") # Vodorovné převrácení
+            fig2.update_xaxes(autorange="reversed")
             st.plotly_chart(fig2, use_container_width=True)
 
         with tab3:
             st.subheader("Finální povrchová tuhost (Kb)")
             fig3 = go.Figure()
             
-            df_final_for_calc = pd.DataFrame() # Pomocná proměnná pro tabulku
+            df_final_for_calc = pd.DataFrame()
             
             if not df_current_raster.empty:
-                df_vib_raster = df_current_raster[df_current_raster['is_vib'] == True]
+                # OPRAVA 3: Propustíme jen ty buňky, které mají reálnou a smysluplnou hodnotu Kb (> 0).
+                # Zabráníme tak přepsání žehlením (statikou s Kb = NaN/0).
+                valid_kb_mask = (df_current_raster['is_vib'] == True) & (df_current_raster['kb'] > 0)
+                df_vib_raster = df_current_raster[valid_kb_mask]
+                
                 if not df_vib_raster.empty:
                     idx_last = df_vib_raster.groupby(['cell_lon', 'cell_lat'])['time'].idxmax()
                     df_final = df_vib_raster.loc[idx_last].copy().reset_index(drop=True)
-                    df_final_for_calc = df_final # Uložení pro výpočet vzdáleností
+                    df_final_for_calc = df_final
                     
                     bins = 15
                     zmin, zmax = target_min - 5, target_max + 5
@@ -380,7 +387,7 @@ if uploaded_file is not None:
                                 ))
 
             fig3.update_layout(yaxis=map_layout, height=700, margin=dict(l=0,r=0,t=0,b=0), showlegend=False)
-            fig3.update_xaxes(autorange="reversed") # Vodorovné převrácení
+            fig3.update_xaxes(autorange="reversed")
             st.plotly_chart(fig3, use_container_width=True)
             
             # --- AUTOMATICKÁ KORELAČNÍ TABULKA ---
@@ -423,7 +430,10 @@ if uploaded_file is not None:
             st.caption("Odhaluje místa s vytvořenou povrchovou krustou. Oranžové body = Finální pojezd v normě, ale v historii měřeno pod limitem.")
             fig4 = go.Figure()
             if not df_current_raster.empty:
-                df_vib_raster = df_current_raster[df_current_raster['is_vib'] == True]
+                # Upraveno taky zde, aby to zbytečně nehledalo minima u NaN hodnot
+                valid_kb_mask = (df_current_raster['is_vib'] == True) & (df_current_raster['kb'] > 0)
+                df_vib_raster = df_current_raster[valid_kb_mask]
+                
                 if not df_vib_raster.empty:
                     df_hist_min = df_vib_raster.groupby(['cell_lon', 'cell_lat'])['kb'].min().reset_index(name='min_kb_history')
                     idx_last = df_vib_raster.groupby(['cell_lon', 'cell_lat'])['time'].idxmax()
@@ -449,13 +459,15 @@ if uploaded_file is not None:
                             hovertext="Lat: " + df_active_under['cell_lat'].round(7).astype(str) + "<br>Lon: " + df_active_under['cell_lon'].round(7).astype(str) + "<br>Finální Kb: " + df_active_under['kb'].round(1).astype(str)))
 
             fig4.update_layout(yaxis=map_layout, height=700, margin=dict(l=0,r=0,t=0,b=0), showlegend=True, legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01))
-            fig4.update_xaxes(autorange="reversed") # Vodorovné převrácení
+            fig4.update_xaxes(autorange="reversed")
             st.plotly_chart(fig4, use_container_width=True)
 
         with tab5:
             st.subheader("Plošná distribuce tuhosti (Kb)")
             if not df_current_raster.empty:
-                df_vib_raster = df_current_raster[df_current_raster['is_vib'] == True]
+                valid_kb_mask = (df_current_raster['is_vib'] == True) & (df_current_raster['kb'] > 0)
+                df_vib_raster = df_current_raster[valid_kb_mask]
+                
                 if not df_vib_raster.empty:
                     idx_last = df_vib_raster.groupby(['cell_lon', 'cell_lat'])['time'].idxmax()
                     df_final = df_vib_raster.loc[idx_last].copy()
@@ -496,7 +508,7 @@ if uploaded_file is not None:
                 ))
 
             fig6.update_layout(yaxis=map_layout, height=700, margin=dict(l=0,r=0,t=0,b=0), showlegend=True, legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01))
-            fig6.update_xaxes(autorange="reversed") # Vodorovné převrácení
+            fig6.update_xaxes(autorange="reversed")
             st.plotly_chart(fig6, use_container_width=True)
 
     else:
