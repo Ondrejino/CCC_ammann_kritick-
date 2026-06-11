@@ -8,6 +8,9 @@ from matplotlib.path import Path
 import io
 import csv
 
+# GLOBÁLNÍ KONSTANTY
+METERS_PER_DEGREE = 111320.0  # Přibližný převod stupňů na metry pro rovníkovou vzdálenost
+
 # --- 1. NASTAVENÍ APLIKACE ---
 st.set_page_config(page_title="CCC Detektor", layout="wide")
 st.title("CCC Detektor")
@@ -28,7 +31,7 @@ def nacti_surova_data(file_bytes):
     header_line = lines[header_idx]
     try:
         sep = csv.Sniffer().sniff(header_line).delimiter
-    except:
+    except Exception:  # Vylepšeno zachytávání výjimek
         sep = ';' if header_line.count(';') > header_line.count(',') else ','
     
     df = pd.read_csv(io.BytesIO(file_bytes), sep=sep, skiprows=header_idx, on_bad_lines='skip', dtype=str, low_memory=False)
@@ -106,11 +109,11 @@ def zpracuj_geodata(df_raw, col_lat, col_lon, col_stiff, col_vib, col_time, col_
     df_valid = df[df['speed_kmh'] >= min_speed_kmh].copy()
     
     if not df_valid.empty:
-        # OPRAVA 2: Výpočet reálné step_dist až po filtraci. Zabrání to vzniku děr u menšího rastru.
+        # Výpočet reálné step_dist až po filtraci
         _, _, dist_valid = geod.inv(df_valid['drum_lon'].shift().bfill().values, df_valid['drum_lat'].shift().bfill().values, df_valid['drum_lon'].values, df_valid['drum_lat'].values)
-        df_valid['step_dist'] = np.clip(dist_valid, 0.1, 5.0) # Zvýšený horní limit, aby pokryl vyhozené body
+        df_valid['step_dist'] = np.clip(dist_valid, 0.1, 10.0) # Zvýšen horní limit na 10 m pro krytí děr při vyšší rychlosti
         
-        # OPRAVA 1: Zohlednění změny vibrace pro nový pojezd.
+        # Zohlednění změny vibrace pro nový pojezd
         dir_cond = df_valid[col_dir] != df_valid[col_dir].shift().bfill() if col_dir in df_valid.columns else False
         vib_cond = df_valid['is_vibrating'] != df_valid['is_vibrating'].shift().bfill()
         time_gap = df_valid['parsed_time'].diff().dt.total_seconds() > 30
@@ -132,8 +135,8 @@ def rasterizuj_do_mrizky(df, grid_size, avg_lat, col_stiff):
     df_work = df[['c1x', 'c1y', 'c2x', 'c2y', 'c3x', 'c3y', 'c4x', 'c4y', 'pass_id', 'is_vibrating', col_stiff, 'parsed_time']].copy()
     df_work.columns = ['c1x', 'c1y', 'c2x', 'c2y', 'c3x', 'c3y', 'c4x', 'c4y', 'pass_id', 'is_vib', 'kb', 'time']
     
-    lat_f = 111320.0
-    lon_f = 111320.0 * np.cos(np.radians(avg_lat))
+    lat_f = METERS_PER_DEGREE
+    lon_f = METERS_PER_DEGREE * np.cos(np.radians(avg_lat)) # Lokální flat-earth aproximace
     
     c1x_m, c1y_m = df_work['c1x'].values * lon_f, df_work['c1y'].values * lat_f
     c2x_m, c2y_m = df_work['c2x'].values * lon_f, df_work['c2y'].values * lat_f
@@ -197,7 +200,7 @@ def rasterizuj_do_mrizky(df, grid_size, avg_lat, col_stiff):
 # --- 5. BOČNÍ PANEL (UI) ---
 with st.sidebar:
     st.header("📂 1. Data")
-    uploaded_file = st.file_uploader("Nahrát CSV", type=['csv'])
+    uploaded_file = st.file_uploader("Nahrát CSV stroje", type=['csv'], key="machine_upload")
     
     if uploaded_file:
         df_raw = nacti_surova_data(uploaded_file.getvalue())
@@ -224,26 +227,45 @@ with st.sidebar:
         colormap = st.selectbox("Paleta Kb", ['Turbo', 'Viridis', 'Jet'], index=0)
         
         st.header("📍 5. Kontrolní zkoušky")
-        st.caption("Korelace s reálnými testy na stavbě")
-        zobrazit_krize = st.checkbox("Vykreslit body v mapě a zjistit Kb", value=False)
+        st.caption("Korelace s reálnými testy na stavbě z CSV")
+        zobrazit_krize = st.checkbox("Vykreslit zkoušky do mapy a zjistit Kb", value=False)
         
         kontrolni_body = []
-        with st.expander("Zadat souřadnice bodů (Až 5 bodů)"):
-            for i in range(1, 6):
-                st.markdown(f"**Zkouška {i}**")
-                col1, col2 = st.columns(2)
-                with col1:
-                    lat_val = st.number_input(f"Lat {i}", format="%.7f", value=0.0, key=f"lat_{i}")
-                with col2:
-                    lon_val = st.number_input(f"Lon {i}", format="%.7f", value=0.0, key=f"lon_{i}")
-                kontrolni_body.append({"id": i, "lat": lat_val, "lon": lon_val})
+        uploaded_zkousky = st.file_uploader("Nahrát CSV se zkouškami", type=['csv'], key="zk_upload")
+        
+        if uploaded_zkousky is not None:
+            try:
+                # Automatická detekce oddělovače
+                df_zkousky = pd.read_csv(uploaded_zkousky, sep=None, engine='python')
+                
+                # Inteligentní hledání sloupců
+                col_nazev = next((c for c in df_zkousky.columns if any(k in str(c).lower() for k in ['nazev', 'název', 'id', 'bod'])), df_zkousky.columns[0])
+                col_lat_zk = next((c for c in df_zkousky.columns if any(k in str(c).lower() for k in ['lat', 'y'])), None)
+                col_lon_zk = next((c for c in df_zkousky.columns if any(k in str(c).lower() for k in ['lon', 'x'])), None)
+                
+                if col_lat_zk and col_lon_zk:
+                    for _, row in df_zkousky.iterrows():
+                        lat_val = float(str(row[col_lat_zk]).replace(',', '.').strip())
+                        lon_val = float(str(row[col_lon_zk]).replace(',', '.').strip())
+                        
+                        if pd.notna(lat_val) and pd.notna(lon_val) and lat_val != 0.0:
+                            kontrolni_body.append({
+                                "id": str(row[col_nazev]),
+                                "lat": lat_val,
+                                "lon": lon_val
+                            })
+                    st.success(f"✅ Úspěšně načteno {len(kontrolni_body)} zkoušek.")
+                else:
+                    st.error("❌ Nepodařilo se najít sloupce pro souřadnice. Hledám názvy s 'lat' a 'lon'.")
+            except Exception as e:
+                st.error(f"❌ Chyba při zpracování CSV se zkouškami: {e}")
 
 # --- 6. RENDER SÍŤOVÝCH BUNĚK V PLOTLY ---
 def generuj_mrizku_trace(df_grid, cell_size_m, avg_lat, color_val, color_scale, zmin, zmax, name):
     if df_grid.empty: return None
     
-    lat_f = 111320.0
-    lon_f = 111320.0 * np.cos(np.radians(avg_lat))
+    lat_f = METERS_PER_DEGREE
+    lon_f = METERS_PER_DEGREE * np.cos(np.radians(avg_lat))
     dx = (cell_size_m / 2) / lon_f
     dy = (cell_size_m / 2) / lat_f
     
@@ -335,8 +357,6 @@ if uploaded_file is not None:
             df_final_for_calc = pd.DataFrame()
             
             if not df_current_raster.empty:
-                # OPRAVA 3: Propustíme jen ty buňky, které mají reálnou a smysluplnou hodnotu Kb (> 0).
-                # Zabráníme tak přepsání žehlením (statikou s Kb = NaN/0).
                 valid_kb_mask = (df_current_raster['is_vib'] == True) & (df_current_raster['kb'] > 0)
                 df_vib_raster = df_current_raster[valid_kb_mask]
                 
@@ -381,8 +401,8 @@ if uploaded_file is not None:
                                     text=[str(pt["id"])],
                                     textposition="top right",
                                     textfont=dict(color="white", size=14, weight="bold"),
-                                    name=f"Zkouška {pt['id']}",
-                                    hovertext=f"📍 Místo zkoušky {pt['id']}<br>Lat: {pt['lat']}<br>Lon: {pt['lon']}",
+                                    name=str(pt['id']),
+                                    hovertext=f"📍 {pt['id']}<br>Lat: {pt['lat']}<br>Lon: {pt['lon']}",
                                     showlegend=False
                                 ))
 
@@ -391,11 +411,11 @@ if uploaded_file is not None:
             st.plotly_chart(fig3, use_container_width=True)
             
             # --- AUTOMATICKÁ KORELAČNÍ TABULKA ---
-            if zobrazit_krize and not df_final_for_calc.empty:
+            if zobrazit_krize and not df_final_for_calc.empty and kontrolni_body:
                 st.markdown("### 📊 Korelace: Hodnoty válce v místech zkoušek")
                 
-                lat_f = 111320.0
-                lon_f = 111320.0 * np.cos(np.radians(avg_lat))
+                lat_f = METERS_PER_DEGREE
+                lon_f = METERS_PER_DEGREE * np.cos(np.radians(avg_lat))
                 
                 vysledky_zkousek = []
                 
@@ -405,17 +425,18 @@ if uploaded_file is not None:
                         dx = (df_final_for_calc['cell_lon'] - pt["lon"]) * lon_f
                         vzdalenosti = np.sqrt(dx**2 + dy**2)
                         
-                        nejblizsi_idx = vzdalenosti.idxmin()
-                        min_vzdalenost = vzdalenosti[nejblizsi_idx]
-                        nalezene_kb = df_final_for_calc.loc[nejblizsi_idx, 'kb']
-                        
-                        vysledky_zkousek.append({
-                            "Zkouška": f"Bod {pt['id']}",
-                            "Zadaná Lat": pt["lat"],
-                            "Zadaná Lon": pt["lon"],
-                            "Kb válce": round(nalezene_kb, 1),
-                            "Odchylka od středu buňky (m)": round(min_vzdalenost, 2)
-                        })
+                        if not vzdalenosti.empty:
+                            nejblizsi_idx = vzdalenosti.idxmin()
+                            min_vzdalenost = vzdalenosti[nejblizsi_idx]
+                            nalezene_kb = df_final_for_calc.loc[nejblizsi_idx, 'kb']
+                            
+                            vysledky_zkousek.append({
+                                "Zkouška (Název)": pt['id'],
+                                "Zadaná Lat": pt["lat"],
+                                "Zadaná Lon": pt["lon"],
+                                "Kb válce": round(nalezene_kb, 1),
+                                "Odchylka od středu buňky (m)": round(min_vzdalenost, 2)
+                            })
                 
                 if vysledky_zkousek:
                     df_vysledky = pd.DataFrame(vysledky_zkousek)
@@ -430,7 +451,6 @@ if uploaded_file is not None:
             st.caption("Odhaluje místa s vytvořenou povrchovou krustou. Oranžové body = Finální pojezd v normě, ale v historii měřeno pod limitem.")
             fig4 = go.Figure()
             if not df_current_raster.empty:
-                # Upraveno taky zde, aby to zbytečně nehledalo minima u NaN hodnot
                 valid_kb_mask = (df_current_raster['is_vib'] == True) & (df_current_raster['kb'] > 0)
                 df_vib_raster = df_current_raster[valid_kb_mask]
                 
