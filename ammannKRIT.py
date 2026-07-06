@@ -224,6 +224,7 @@ with st.sidebar:
         st.header("📍 5. Kontrolní zkoušky")
         st.caption("Korelace s reálnými testy na stavbě z CSV")
         zobrazit_krize = st.checkbox("Vykreslit zkoušky do mapy a zjistit Kb", value=False)
+        polomer_okoli = st.number_input("Poloměr pro průměr Kb (m)", value=1.0, step=0.1, help="Kruhové okolí zkoušky. Pokud je 0, bere se nejbližší bod.")
         
         kontrolni_body = []
         uploaded_zkousky = st.file_uploader("Nahrát CSV se zkouškami", type=['csv'], key="zk_upload")
@@ -339,6 +340,23 @@ if uploaded_file is not None:
                     hovertext="Počet přejezdů: " + df_counts['pass_count'].astype(str) + "<br>Lat: " + df_counts['cell_lat'].round(7).astype(str) + "<br>Lon: " + df_counts['cell_lon'].round(7).astype(str),
                     showlegend=False
                 ))
+
+            # --- VYKRESLENÍ KŘÍŽKŮ V MAPĚ PŘEKRYVŮ ---
+            if zobrazit_krize:
+                for pt in kontrolni_body:
+                    if pt["lat"] != 0.0 and pt["lon"] != 0.0:
+                        fig2.add_trace(go.Scattergl(
+                            x=[pt["lon"]], y=[pt["lat"]],
+                            mode='markers+text',
+                            marker=dict(symbol='cross', size=16, color='red', line=dict(color='darkred', width=2)),
+                            text=[str(pt["id"])],
+                            textposition="top right",
+                            textfont=dict(color="red", size=15, weight="bold"),
+                            name=str(pt['id']),
+                            hovertext=f"📍 {pt['id']}<br>Lat: {pt['lat']}<br>Lon: {pt['lon']}",
+                            showlegend=False
+                        ))
+
             fig2.update_layout(yaxis=map_layout, height=700, margin=dict(l=0,r=0,t=0,b=0), showlegend=True)
             fig2.update_xaxes(autorange="reversed")
             st.plotly_chart(fig2, use_container_width=True)
@@ -387,13 +405,10 @@ if uploaded_file is not None:
                                 fig3.add_trace(go.Scattergl(
                                     x=[pt["lon"]], y=[pt["lat"]],
                                     mode='markers+text',
-                                    marker=dict(
-                                        symbol='cross', size=16, color='black', 
-                                        line=dict(color='white', width=2)
-                                    ),
+                                    marker=dict(symbol='cross', size=16, color='red', line=dict(color='darkred', width=2)),
                                     text=[str(pt["id"])],
                                     textposition="top right",
-                                    textfont=dict(color="white", size=14, weight="bold"),
+                                    textfont=dict(color="red", size=15, weight="bold"),
                                     name=str(pt['id']),
                                     hovertext=f"📍 {pt['id']}<br>Lat: {pt['lat']}<br>Lon: {pt['lon']}",
                                     showlegend=False
@@ -419,25 +434,45 @@ if uploaded_file is not None:
                         vzdalenosti = np.sqrt(dx**2 + dy**2)
                         
                         if not vzdalenosti.empty:
-                            nejblizsi_idx = vzdalenosti.idxmin()
-                            min_vzdalenost = vzdalenosti[nejblizsi_idx]
+                            in_radius = vzdalenosti <= polomer_okoli
                             
-                            target_lon = df_final_for_calc.loc[nejblizsi_idx, 'cell_lon']
-                            target_lat = df_final_for_calc.loc[nejblizsi_idx, 'cell_lat']
-                            
-                            history_cell = df_vib_raster[(df_vib_raster['cell_lon'] == target_lon) & (df_vib_raster['cell_lat'] == target_lat)].sort_values('pass_id')
+                            # Pokud hledáme v poloměru a našli jsme nějaké body
+                            if polomer_okoli > 0 and in_radius.any():
+                                vybrane_idx = vzdalenosti[in_radius].index
+                                min_vzdal_text = f"Průměr (R={polomer_okoli}m)"
+                                final_kb = df_final_for_calc.loc[vybrane_idx, 'kb'].mean()
+                                
+                                # Historie z oblasti
+                                target_lons = df_final_for_calc.loc[vybrane_idx, 'cell_lon']
+                                target_lats = df_final_for_calc.loc[vybrane_idx, 'cell_lat']
+                                
+                                # Vyfiltrujeme celou historii jen pro tyto buňky a zprůměrujeme dle přejezdů
+                                merged_coords = pd.DataFrame({'cell_lon': target_lons, 'cell_lat': target_lats})
+                                history_cells = df_vib_raster.merge(merged_coords, on=['cell_lon', 'cell_lat'])
+                                hist_avg = history_cells.groupby('pass_id')['kb'].mean()
+                                
+                            else:
+                                # Původní logika: vezmi striktně jen nejbližší bod
+                                nejblizsi_idx = vzdalenosti.idxmin()
+                                nejmensi_vzdal = vzdalenosti[nejblizsi_idx]
+                                min_vzdal_text = f"Nejbližší ({round(nejmensi_vzdal, 2)} m)"
+                                final_kb = df_final_for_calc.loc[nejblizsi_idx, 'kb']
+                                
+                                target_lon = df_final_for_calc.loc[nejblizsi_idx, 'cell_lon']
+                                target_lat = df_final_for_calc.loc[nejblizsi_idx, 'cell_lat']
+                                history_cells = df_vib_raster[(df_vib_raster['cell_lon'] == target_lon) & (df_vib_raster['cell_lat'] == target_lat)]
+                                hist_avg = history_cells.groupby('pass_id')['kb'].mean()
                             
                             zaznam = {
                                 "Zkouška (Název)": pt['id'],
                                 "Zadaná Lat": pt["lat"],
                                 "Zadaná Lon": pt["lon"],
-                                "Odchylka od středu (m)": round(min_vzdalenost, 2),
-                                "Finální Kb": round(df_final_for_calc.loc[nejblizsi_idx, 'kb'], 1)
+                                "Metoda / Odchylka": min_vzdal_text,
+                                "Finální Kb": round(final_kb, 1) if pd.notna(final_kb) else np.nan
                             }
                             
-                            for _, row in history_cell.iterrows():
-                                pass_num = int(row['pass_id'])
-                                zaznam[f"Kb (Přejezd {pass_num})"] = round(row['kb'], 1)
+                            for pass_id, kb_val in hist_avg.items():
+                                zaznam[f"Kb (Přejezd {int(pass_id)})"] = round(kb_val, 1)
                                 
                             vysledky_zkousek.append(zaznam)
                 
@@ -445,19 +480,14 @@ if uploaded_file is not None:
                     df_vysledky = pd.DataFrame(vysledky_zkousek)
                     
                     zakladni_sloupce = ["Zkouška (Název)", "Zadaná Lat", "Zadaná Lon"]
-                    # Bezpečné seřazení dynamických sloupců podle čísla přejezdu
                     prejezdy_sloupce = sorted([col for col in df_vysledky.columns if "Kb (Přejezd" in col], 
                                               key=lambda x: int(x.replace("Kb (Přejezd ", "").replace(")", "")))
-                    konec_sloupce = ["Finální Kb", "Odchylka od středu (m)"]
+                    konec_sloupce = ["Finální Kb", "Metoda / Odchylka"]
                     
                     final_cols = zakladni_sloupce + prejezdy_sloupce + konec_sloupce
                     df_vysledky = df_vysledky[final_cols]
                     
                     st.dataframe(df_vysledky, use_container_width=True)
-                    
-                    max_odchylka = df_vysledky["Odchylka od středu (m)"].max()
-                    if max_odchylka > (grid_size * 2):
-                        st.warning(f"⚠️ Pozor: Některé body leží docela daleko (max {max_odchylka} m) od nejbližší projeté trasy válce. Zkontroluj si souřadnice!")
 
         with tab4:
             st.subheader("Analýza historických rizik a krusty (Bodově)")
