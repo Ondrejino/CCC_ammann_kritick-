@@ -210,7 +210,8 @@ with st.sidebar:
         col_speed = st.selectbox("Rychlost", ["Vypočítat z GPS"] + list(df_raw.columns), index=0)
 
         st.header("📐 3. Stroj a Rastrování")
-        offset_fwd = st.number_input("Posun antény podélně (m)", value=2.65, step=0.05)
+        # ZMĚNA ZDE: value posunu vpřed z 2.65 na 2.80
+        offset_fwd = st.number_input("Posun antény podélně (m)", value=2.80, step=0.05)
         offset_right = st.number_input("Posun antény příčně (m)", value=0.26, step=0.01, help="Kladné = doprava, Záporné = doleva")
         roller_width = st.number_input("Šířka běhounu (m)", value=2.13, step=0.01)
         grid_size = st.slider("Přesnost Mřížky/Rasteru (m)", 0.2, 1.0, 0.5, 0.1)
@@ -254,7 +255,7 @@ with st.sidebar:
             except Exception as e:
                 st.error(f"❌ Chyba při zpracování CSV se zkouškami: {e}")
 
-# --- 6. RENDER SÍŤOVÝCH BUNĚK V PLOTLY ---
+# --- 6. RENDER SÍŤOVÝCH BUNĚK A KRESLENÍ V PLOTLY ---
 def generuj_mrizku_trace(df_grid, cell_size_m, avg_lat, color_val, color_scale, zmin, zmax, name):
     if df_grid.empty: return None
     
@@ -284,6 +285,17 @@ def generuj_mrizku_trace(df_grid, cell_size_m, avg_lat, color_val, color_scale, 
     else: fill_color = sample_colorscale(color_scale, [np.clip((color_val - zmin) / (zmax - zmin) if zmax > zmin else 0, 0, 1)])[0]
 
     return go.Scatter(x=x_flat, y=y_flat, fill='toself', mode='lines', line=dict(width=0), fillcolor=fill_color, opacity=0.9, name=name, hoverinfo='skip', showlegend=False)
+
+def generuj_kruh_kolem_bodu(lon, lat, polomer_m, avg_lat):
+    """Vygeneruje souřadnice kruhu v lat/lon o daném poloměru v metrech pro plotly vykreslení."""
+    if polomer_m <= 0:
+        return [], []
+    lat_f = METERS_PER_DEGREE
+    lon_f = METERS_PER_DEGREE * np.cos(np.radians(avg_lat))
+    angles = np.linspace(0, 2 * np.pi, 32)
+    c_lon = lon + (polomer_m * np.cos(angles)) / lon_f
+    c_lat = lat + (polomer_m * np.sin(angles)) / lat_f
+    return c_lon.tolist(), c_lat.tolist()
 
 # --- 7. HLAVNÍ LOGIKA ---
 if uploaded_file is not None:
@@ -341,10 +353,19 @@ if uploaded_file is not None:
                     showlegend=False
                 ))
 
-            # --- VYKRESLENÍ KŘÍŽKŮ V MAPĚ PŘEKRYVŮ ---
+            # --- VYKRESLENÍ KŘÍŽKŮ A KRUHŮ V MAPĚ PŘEKRYVŮ ---
             if zobrazit_krize:
                 for pt in kontrolni_body:
                     if pt["lat"] != 0.0 and pt["lon"] != 0.0:
+                        # Vykreslení oblasti poloměru
+                        if polomer_okoli > 0:
+                            c_lon, c_lat = generuj_kruh_kolem_bodu(pt["lon"], pt["lat"], polomer_okoli, avg_lat)
+                            fig2.add_trace(go.Scatter(
+                                x=c_lon, y=c_lat, mode='lines', fill='toself',
+                                fillcolor='rgba(255, 0, 0, 0.15)', line=dict(color='red', width=1, dash='dot'),
+                                hoverinfo='skip', showlegend=False
+                            ))
+                        # Křížek
                         fig2.add_trace(go.Scattergl(
                             x=[pt["lon"]], y=[pt["lat"]],
                             mode='markers+text',
@@ -398,10 +419,19 @@ if uploaded_file is not None:
                         showlegend=False
                     ))
                     
-                    # --- VYKRESLENÍ KŘÍŽKŮ V MAPĚ ---
+                    # --- VYKRESLENÍ KŘÍŽKŮ A KRUHŮ V MAPĚ TUHOSTI ---
                     if zobrazit_krize:
                         for pt in kontrolni_body:
                             if pt["lat"] != 0.0 and pt["lon"] != 0.0:
+                                # Vykreslení oblasti poloměru
+                                if polomer_okoli > 0:
+                                    c_lon, c_lat = generuj_kruh_kolem_bodu(pt["lon"], pt["lat"], polomer_okoli, avg_lat)
+                                    fig3.add_trace(go.Scatter(
+                                        x=c_lon, y=c_lat, mode='lines', fill='toself',
+                                        fillcolor='rgba(255, 0, 0, 0.15)', line=dict(color='red', width=1, dash='dot'),
+                                        hoverinfo='skip', showlegend=False
+                                    ))
+                                # Křížek
                                 fig3.add_trace(go.Scattergl(
                                     x=[pt["lon"]], y=[pt["lat"]],
                                     mode='markers+text',
