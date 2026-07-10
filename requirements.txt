@@ -1,7 +1,6 @@
 streamlit
-pandas==2.2.2
-numpy==1.26.4
-pyarrow==15.0.2
+pandas
+numpy
 plotly
 pyproj
 matplotlib
